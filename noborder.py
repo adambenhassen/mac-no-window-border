@@ -14,14 +14,16 @@ The rounded corners are a mask AppKit hands WindowServer for each window, and th
 rim along the titlebar edge is drawn by AppKit's titlebar decoration view; only the owning
 app can change either. When a window becomes (or stops being) maximized, the daemon briefly
 attaches to its app and queues -[NSWindow _setCornerRadius:] plus drawsDecorationView on the
-titlebar container on the app's main run loop. The app is paused for ~1 s per batch (~3 s on
-the first attach, while lldb parses the shared cache). Non-AppKit windows keep their corners.
+titlebar container on the app's main run loop. The app is paused for ~1 s per batch (~3-6 s
+on the first attach after a minute without one, while lldb parses the shared cache). Non-AppKit
+windows keep their corners.
 That only happens while the app's main thread waits in its run loop; a busy app can be paused
 holding its allocator lock, so nothing runs in it and its windows are retried after 1 and 2 s,
 then left alone until they change. Apps launched less than 30 s ago are never attached to.
 
 Requirements: SIP disabled (task_for_pid on Dock and apps), Xcode (its LLDB Python module).
 Usage: noborder.py [--pids PID,PID...]   (--pids: only manage these apps' windows; for testing)
+       noborder.py --apps-helper          (internal: the app-attach child process, see AppsHelper)
 NOBORDER_GRACE_S overrides the 30 s launch grace (tests/e2e.sh sets 0).
 Prints `status: ...` lines for NoBorder.app. SIGTERM, SIGINT or the parent process exiting
 restores the changed windows, then exits. A busy app's windows can stay changed if the app is
@@ -44,6 +46,7 @@ NOSHADOW_TAG = 1 << 3
 CORNER_RADIUS = 0.01    # AppKit treats 0 as "use the default radius"; sub-pixel draws square
 IDLE_TRAPS = {"mach_msg2_trap", "mach_msg_trap"}
 SHUTDOWN_RETRY_S = 5.0  # how long the restore on exit keeps retrying busy apps
+APPS_IDLE_S = 60.0      # stop the app-attach child after this long unused, freeing lldb's caches
 
 
 def grace_seconds():
@@ -234,6 +237,75 @@ class Apps:
         return "ok" if ok and n == len(wids) else "failed"
 
 
+class AppsHelper:
+    """Apps in a child process (noborder.py --apps-helper). lldb never frees the modules an attach
+    loads (~1.3 GB of system libraries for an Electron app), so the child is stopped after
+    APPS_IDLE_S unused, returning that memory; attaches within a burst still share its cache.
+    Protocol: one `apply|restore <pid> <wid>...` line in; the child's log lines, then `= <result>`."""
+
+    def __init__(self, cmd=None, idle_s=APPS_IDLE_S):
+        self.cmd = cmd or [sys.executable, os.path.abspath(__file__), "--apps-helper"]
+        self.idle_s = idle_s
+        self.proc = None
+        self.last_used = 0.0
+
+    def apply(self, pid, wids):
+        return self._call("apply", pid, wids)
+
+    def restore(self, pid, wids):
+        return self._call("restore", pid, wids)
+
+    def _call(self, verb, pid, wids):
+        if self.proc is not None and self.proc.poll() is not None:  # died while idle: nothing lost
+            log(f"apps helper exited with code {self.proc.returncode}")
+            self.proc = None
+        if self.proc is None:
+            self.proc = subprocess.Popen(self.cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                         text=True, bufsize=1)
+        self.last_used = time.monotonic()
+        try:
+            self.proc.stdin.write(f"{verb} {pid} {' '.join(map(str, wids))}\n")
+            self.proc.stdin.flush()
+            for line in self.proc.stdout:
+                if line.startswith("= "):
+                    return line[2:].strip()
+                emit(line.rstrip("\n"))
+        except BrokenPipeError:
+            pass
+        # EOF or closed pipe: the child died during this call (an lldb crash), so the outcome is unknown
+        log(f"apps helper died during {verb} for pid {pid} (code {self.proc.wait()})")
+        self.proc = None
+        return "failed"
+
+    def stop_if_idle(self):
+        if self.proc is not None and time.monotonic() - self.last_used >= self.idle_s:
+            self.stop()
+
+    def stop(self):
+        """Close the child's input; it exits at EOF."""
+        if self.proc is None:
+            return
+        self.proc.stdin.close()
+        try:
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            log("apps helper did not exit; killing it")
+            self.proc.kill()
+            self.proc.wait()
+        self.proc = None
+
+
+def apps_helper():
+    """--apps-helper: run each request line from AppsHelper with one Apps session until EOF."""
+    signal.signal(signal.SIGINT, signal.SIG_IGN)  # on Ctrl-C the daemon still restores through us
+    apps = Apps()
+    for line in sys.stdin:
+        verb, pid, *wids = line.split()
+        act = apps.apply if verb == "apply" else apps.restore
+        emit(f"= {act(int(pid), [int(w) for w in wids])}")
+    return 0
+
+
 class Dock:
     """One lldb session attached to Dock, normally running (async)."""
 
@@ -349,6 +421,9 @@ def run(acts, dock, apps):
 
 def main():
     global lldb
+    if "--apps-helper" in sys.argv:
+        lldb = load_lldb()
+        return apps_helper() if lldb else 1
     only = None
     if "--pids" in sys.argv:
         only = {int(p) for p in sys.argv[sys.argv.index("--pids") + 1].split(",")}
@@ -361,7 +436,7 @@ def main():
         return 1
 
     dock = Dock()
-    apps = Apps()
+    apps = AppsHelper()
     tracker = windowstate.Tracker()
     parent = os.getppid()
     stop = {"flag": False}
@@ -400,6 +475,7 @@ def main():
                         log("parent process exited; stopping")
                         stop["flag"] = True
                         break
+                    apps.stop_if_idle()
                     if not readable:
                         continue
                     data = os.read(fd, 1 << 20)  # more than a pipe holds: everything available
@@ -447,6 +523,7 @@ def main():
                         if pid_alive(pid) and apps.restore(pid, wids) == "busy"]
             for pid, _, _ in busy:
                 log(f"pid {pid} still busy; windows left changed")
+        apps.stop()
         if dock.process is not None:
             dock.detach()
         log("exiting")
