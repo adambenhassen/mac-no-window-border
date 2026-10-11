@@ -10,14 +10,14 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/adambenhassen/macos-no-window-border/releases/latest"><img src="https://img.shields.io/github/v/release/adambenhassen/macos-no-window-border?label=release" alt="Latest release"></a>
+  <a href="https://github.com/adambenhassen/mac-no-window-border/releases/latest"><img src="https://img.shields.io/github/v/release/adambenhassen/mac-no-window-border?label=release" alt="Latest release"></a>
   <img src="https://img.shields.io/badge/macOS-14%2B-lightgrey" alt="macOS 14 or later">
-  <a href="https://adambenhassen.github.io/macos-no-window-border/"><img src="https://img.shields.io/badge/website-online-6e45e2" alt="Website"></a>
+  <a href="https://adambenhassen.github.io/mac-no-window-border/"><img src="https://img.shields.io/badge/website-online-6e45e2" alt="Website"></a>
 </p>
 
 <p align="center">
-  <a href="https://adambenhassen.github.io/macos-no-window-border/">Website</a> ·
-  <a href="https://github.com/adambenhassen/macos-no-window-border/releases/latest/download/NoBorder.zip">Download</a> ·
+  <a href="https://adambenhassen.github.io/mac-no-window-border/">Website</a> ·
+  <a href="https://github.com/adambenhassen/mac-no-window-border/releases/latest/download/NoBorder.zip">Download</a> ·
   <a href="#install">Install</a> ·
   <a href="#how-it-works">How it works</a>
 </p>
@@ -54,15 +54,15 @@
 
 ## Install
 
-**Download:** get [NoBorder.zip](https://github.com/adambenhassen/macos-no-window-border/releases/latest/download/NoBorder.zip),
+**Download:** get [NoBorder.zip](https://github.com/adambenhassen/mac-no-window-border/releases/latest/download/NoBorder.zip),
 unzip it, move `NoBorder.app` to Applications and open it. It isn't notarized, so macOS blocks
 the first launch: open System Settings › Privacy & Security and click **Open Anyway**.
 
 **Build from source:**
 
 ```sh
-git clone https://github.com/adambenhassen/macos-no-window-border
-cd macos-no-window-border
+git clone https://github.com/adambenhassen/mac-no-window-border
+cd mac-no-window-border
 make install     # build NoBorder.app and copy it to /Applications
 open /Applications/NoBorder.app
 ```

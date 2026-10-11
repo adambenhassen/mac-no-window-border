@@ -259,8 +259,8 @@
     <p class="lead">The look of fullscreen, without fullscreen mode.</p>
     <p class="tagline">Maximized windows go edge to edge: no outline, no rounded corners, no titlebar rim. The menu bar and Dock stay put, the window stays on your current Space, and nothing slides away.</p>
     <div class="buttons">
-      <a class="button primary" href="https://github.com/adambenhassen/macos-no-window-border/releases/latest/download/NoBorder.zip">Download</a>
-      <a class="button" href="https://github.com/adambenhassen/macos-no-window-border">View on GitHub</a>
+      <a class="button primary" href="https://github.com/adambenhassen/mac-no-window-border/releases/latest/download/NoBorder.zip">Download</a>
+      <a class="button" href="https://github.com/adambenhassen/mac-no-window-border">View on GitHub</a>
     </div>
 
     <div class="compare">
@@ -356,15 +356,15 @@
     <div class="panel" id="panel-download" role="tabpanel" aria-labelledby="tab-download">
       <h3 class="panel-title">Download</h3>
       <ol>
-        <li>Download <a href="https://github.com/adambenhassen/macos-no-window-border/releases/latest/download/NoBorder.zip">NoBorder.zip</a> and unzip it.</li>
+        <li>Download <a href="https://github.com/adambenhassen/mac-no-window-border/releases/latest/download/NoBorder.zip">NoBorder.zip</a> and unzip it.</li>
         <li>Move <code>NoBorder.app</code> to Applications and open it.</li>
         <li>It isn't notarized, so macOS blocks the first launch. Open System Settings › Privacy &amp; Security and click <em>Open Anyway</em>.</li>
       </ol>
     </div>
     <div class="panel" id="panel-source" role="tabpanel" aria-labelledby="tab-source">
       <h3 class="panel-title">Build from source</h3>
-<pre><code>git clone https://github.com/adambenhassen/macos-no-window-border
-cd macos-no-window-border
+<pre><code>git clone https://github.com/adambenhassen/mac-no-window-border
+cd mac-no-window-border
 make install
 open /Applications/NoBorder.app</code></pre>
     </div>
@@ -383,12 +383,12 @@ open /Applications/NoBorder.app</code></pre>
 
   <section>
     <h2>How it works</h2>
-    <p>A small daemon keeps an LLDB session attached to Dock and calls WindowServer from inside it to set each maximized window's no-shadow tag, which removes the outline. For corners and the rim, it briefly attaches to the window's app and queues two AppKit calls on the app's main run loop. Details are in the <a href="https://github.com/adambenhassen/macos-no-window-border#readme">README</a>.</p>
+    <p>A small daemon keeps an LLDB session attached to Dock and calls WindowServer from inside it to set each maximized window's no-shadow tag, which removes the outline. For corners and the rim, it briefly attaches to the window's app and queues two AppKit calls on the app's main run loop. Details are in the <a href="https://github.com/adambenhassen/mac-no-window-border#readme">README</a>.</p>
   </section>
 </main>
 
 <footer class="wrap">
-  <a href="https://github.com/adambenhassen/macos-no-window-border">github.com/adambenhassen/macos-no-window-border</a>
+  <a href="https://github.com/adambenhassen/mac-no-window-border">github.com/adambenhassen/mac-no-window-border</a>
 </footer>
 
 <script>
