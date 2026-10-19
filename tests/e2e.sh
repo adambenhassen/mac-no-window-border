@@ -55,30 +55,35 @@ checkcount() {  # checkcount <label> <want> <got>
     fi
 }
 
-strip() {  # strip <png>: capture a 40 px strip across the maximized window's left edge
-    typeset x y w h
-    read _ x y w h < <(tests/wbounds $max)
-    # y+150 and h-400 keep the strip away from the corners and the titlebar, so what it can show is
-    # the outline along the left edge — nothing else changes over that span.
-    screencapture -x -o -R"$x,$(( y + 150 )),40,$(( h - 400 ))" $1
+windowShot() {  # windowShot <png>: the maximized window's own bits, captured by window id.
+    # Nothing is drawn in front of a window capture, and no other window's content can appear in it:
+    # that is what makes it a reading of *this* window. A screen-region capture is neither — it has
+    # shown the user's terminal (clean=1 with the change present) and a scrolled terminal panel
+    # (1450 of 1450 rows at both edge columns, the whole strip, which is not a window outline).
+    screencapture -x -o -l $max $1
 }
 
-edge() {  # edge <a.png> <b.png>: the two edge columns of a strip comparison
-    tests/pxband $1 $2 $edgeThr 0 2
+windowBand() {  # windowBand <a.png> <b.png>: compare every pixel of the window's own capture
+    typeset w=$(sips -g pixelWidth $1 | awk '/pixelWidth/{print $2}')
+    tests/pxband $1 $2 $edgeThr 0 $w 0 1
 }
 
-edgeVerdict() {  # edgeVerdict <pxband line>: tall (edge changed over almost the whole strip),
-                 # edge (both edge columns moved), clean (nothing at all differs)
+windowVerdict() {  # windowVerdict <pxband line>: changed (some of the window's own pixels moved) and
+                   # clean (none of them did). Measured over the whole window on purpose: what the
+                   # change does, in pixels, is the rim's 1 px line under the titlebar across the
+                   # full width and the corner curves down the sides — about 16 rows on a 2250-row
+                   # capture. That is the honest size of it, so the assertion is "any of it moved" and
+                   # "none of it is left moved", and the reading of *which* of the three changes
+                   # landed is winpixels above. Nothing here can be produced by the desktop: a window
+                   # capture contains only the window.
     print -r -- "$1" | awk '
-    {   h = 0; rows = -1; split("", c)
+    {   h = 0; rows = -1
         for (i = 1; i <= NF; i++) {
             f = $i
-            if (f ~ /^height=/)        { sub(/^height=/, "", f);        h = f + 0 }
+            if (f ~ /^height=/)             { sub(/^height=/, "", f); h = f + 0 }
             else if (f ~ /^rows_with_diff=/) { sub(/^rows_with_diff=/, "", f); rows = f + 0 }
-            else { sub(/^cols=/, "", f)
-                   if (f ~ /^[0-9]+:[0-9]+$/) { split(f, kv, ":"); c[kv[1]] = kv[2] + 0 } }
         }
-        printf "tall=%d edge=%d clean=%d", (rows >= 0.9 * h), (c[0] > 0 && c[1] > 0), (rows == 0)
+        printf "changed=%d clean=%d rows=%d height=%d", (rows > 0), (rows == 0), rows, h
     }'
 }
 
@@ -88,7 +93,7 @@ native_path() {  # the native engine, driven through the probe, verified on pixe
     typeset out=build/e2e
     [[ -f build/noborder-probe ]] || { echo "FAIL no build/noborder-probe (make probe)"; fail=1; return; }
 
-    strip $out/pre.png
+    windowShot $out/pre.png
     log=$out/native.log
     build/noborder-probe apply $host $max > $log 2>&1
     grep -q "^applying $max" $log && echo "PASS native logs applying: $(head -1 $log)" \
@@ -103,12 +108,13 @@ native_path() {  # the native engine, driven through the probe, verified on pixe
     # is printed here to show the native path never consults it: every decision above is pixels.
     echo "note winscan after native apply (not a signal): $(./winscan --all | awk -F'\t' -v w=$max '$1==w {print $(NF-1), $NF}')"
 
-    # The outline itself: the left edge of the window, over almost the whole strip height.
-    strip $out/applied.png
-    band=$(edge $out/pre.png $out/applied.png)
-    verdict=$(edgeVerdict $band)
-    [[ "$verdict" == "tall=1 edge=1 clean=0" ]] && echo "PASS native changed the outline: $band" \
-        || { echo "FAIL native outline unchanged: $band ($verdict)"; fail=1; }
+    # The change, in the window's own pixels: not a heuristic about corners, and not anything the
+    # desktop in front of it can fake.
+    windowShot $out/applied.png
+    band=$(windowBand $out/pre.png $out/applied.png)
+    verdict=$(windowVerdict $band)
+    [[ "$verdict" == "changed=1"* ]] && echo "PASS native changed the window's own pixels: $verdict" \
+        || { echo "FAIL native left the window's pixels unchanged: $band ($verdict)"; fail=1; }
 
     build/noborder-probe restore $host $max > $out/native-restore.log 2>&1
     grep -q "^restoring $max" $out/native-restore.log && echo "PASS native logs restoring: $(head -1 $out/native-restore.log)" \
@@ -116,11 +122,11 @@ native_path() {  # the native engine, driven through the probe, verified on pixe
     probe_px
     [[ "$px" == "square=0 rim=1" ]] && echo "PASS native restored on pixels: $px" \
         || { echo "FAIL native restored on pixels: got '$px', want 'square=0 rim=1'"; fail=1; }
-    strip $out/restored.png
-    band=$(edge $out/pre.png $out/restored.png)
-    verdict=$(edgeVerdict $band)
-    [[ "$verdict" == *"clean=1"* ]] && echo "PASS native restore returns the original edge: $band" \
-        || { echo "FAIL native restore left the edge changed: $band ($verdict)"; fail=1; }
+    windowShot $out/restored.png
+    band=$(windowBand $out/pre.png $out/restored.png)
+    verdict=$(windowVerdict $band)
+    [[ "$verdict" == *"clean=1"* ]] && echo "PASS native restore returns the original pixels: $band" \
+        || { echo "FAIL native restore left the window changed: $band ($verdict)"; fail=1; }
 
     # Review Focus: a target that is not an AppKit app. It has no window to check, so the assertion
     # is that the engine says why it stopped, and that hostapp's window is left as it was.
@@ -141,12 +147,112 @@ probe_px() {  # probe_px: sets px from a window capture of the maximized window
     px=$(tests/winpixels $out/w.png)
 }
 
+# The built app, run for real. `NOBORDER_E2E=app`.
+#
+# This is the only mode that runs the shipped product: the scan loop, the scanner, the real engine and
+# the app's own log file. It is also the only mode that touches the user's other apps — the native
+# scan sees every window on the screen, and the legacy one attaches to Dock — so it is run on request,
+# not as part of `make test`.
+app_mode() {
+    typeset binary=build/NoBorder.app/Contents/MacOS/NoBorder
+    typeset logfile=$HOME/Library/Logs/macos-no-window-border.log
+    [[ -x $binary ]] || { echo "FAIL no built app: $binary (make app)"; fail=1; return; }
+    touch $logfile
+
+    windowShot $out/app-pre.png
+
+    app=""
+    applog() {  # only the lines this run wrote
+        tail -c +$(( appStart + 1 )) $logfile
+    }
+    await() {  # await <pattern>: wait for a line in the app's log, up to 40 s
+        local deadline=$((SECONDS + ${2:-40}))
+        while true; do
+            applog | grep -q "$1" && return 0
+            (( SECONDS >= deadline )) && return 1
+            sleep 0.5
+        done
+    }
+    runapp() {  # runapp <label> <args…>: start the app, remembering where its log starts
+        typeset label=$1
+        shift
+        appStart=$(wc -c < $logfile)
+        $binary "$@" > $out/$label.log 2>&1 & app=$!
+        echo "note app started for $label (pid $app): $*"
+    }
+    stopapp() {  # SIGTERM: the app puts every window it changed back, then exits
+        [[ -n $app ]] || return
+        kill -TERM $app 2>/dev/null
+        local deadline=$((SECONDS + 30))
+        while kill -0 $app 2>/dev/null && (( SECONDS < deadline )); do sleep 0.25; done
+        if kill -0 $app 2>/dev/null; then
+            echo "FAIL the app did not exit within 30 s of SIGTERM"
+            fail=1
+            kill -9 $app 2>/dev/null
+        fi
+        wait $app 2>/dev/null
+        app=""
+    }
+
+    # The native engine, in the app: the same window, the same pixels, judged through the app's log.
+    # The app's own lines are timestamped, like the daemon's, so the patterns are not anchored.
+    runapp native -noborderEngine native
+    if await "applying $max\$"; then
+        echo "PASS app(native) logs applying: $(applog | grep "applying $max" | head -1)"
+    else
+        echo "FAIL app(native) never applied the maximized window: $(applog | tail -5)"
+        fail=1
+    fi
+    probe_px
+    [[ "$px" == "square=1 rim=0" ]] && echo "PASS app(native) squares the window: $px" \
+        || { echo "FAIL app(native) pixels: got '$px', want 'square=1 rim=0'"; fail=1; }
+    windowShot $out/app-applied.png
+    band=$(windowBand $out/app-pre.png $out/app-applied.png)
+    verdict=$(windowVerdict $band)
+    [[ "$verdict" == "changed=1"* ]] && echo "PASS app(native) changed the window's own pixels: $verdict" \
+        || { echo "FAIL app(native) left the window's pixels unchanged: $band ($verdict)"; fail=1; }
+
+    kill -USR1 $host
+    if await "restoring $max\$"; then
+        echo "PASS app(native) logs restoring after un-maximizing: $(applog | grep "restoring $max" | head -1)"
+    else
+        echo "FAIL app(native) did not restore the un-maximized window: $(applog | tail -5)"
+        fail=1
+    fi
+    probe_px
+    [[ "$px" == "square=0 rim=1" ]] && echo "PASS app(native) puts the window back: $px" \
+        || { echo "FAIL app(native) after restore: got '$px', want 'square=0 rim=1'"; fail=1; }
+    windowShot $out/app-restored.png
+    band=$(windowBand $out/app-pre.png $out/app-restored.png)
+    verdict=$(windowVerdict $band)
+    [[ "$verdict" == *"clean=1"* ]] && echo "PASS app(native) restore returns the original pixels: $band" \
+        || { echo "FAIL app(native) restore left the window changed: $band ($verdict)"; fail=1; }
+    # The log says every refusal once per process, not once per scan (four a second would bury it).
+    local refusals=$(applog | grep -c "skipped (not AppKit)")
+    local pids=$(applog | awk '$4=="(not" && $5=="AppKit)" {print $6}' | sort -u | wc -l)
+    [[ "$refusals" == "$pids" ]] && echo "PASS app(native) says each refusal once per process: $refusals for $pids processes" \
+        || { echo "FAIL app(native) repeats refusals: $refusals lines for $pids processes"; fail=1; }
+    stopapp
+
+    # No arguments: the app must still start the Python daemon, as it did in v1.1.
+    runapp legacy
+    if await "^status: running"; then
+        echo "PASS app(legacy) starts the daemon: $(applog | grep "^status: running" | head -1)"
+    else
+        echo "FAIL app(legacy) did not start the daemon: $(applog | tail -5)"
+        fail=1
+    fi
+    stopapp
+}
+
 host=""
 daemon=""
 parent=""
 daemon2=""
+app=""
 cleanup() {
     [[ -n $parent ]] && kill -9 $parent 2>/dev/null
+    [[ -n $app ]] && kill -TERM $app 2>/dev/null
     for d in $daemon $daemon2; do  # SIGTERM restores; wait up to 30 s before killing the host
         kill -TERM $d 2>/dev/null || continue
         for _ in {1..60}; do kill -0 $d 2>/dev/null || break; sleep 0.5; done
@@ -167,6 +273,11 @@ max=$(awk '$1=="max" {print $2}' $out/host.txt)
 float=$(awk '$1=="floating" {print $2}' $out/host.txt)
 
 export NOBORDER_GRACE_S=0  # the test app was just launched
+
+if [[ "${NOBORDER_E2E:-}" == app ]]; then   # the built app itself, both engines
+    app_mode
+    exit $fail
+fi
 
 if [[ "${NOBORDER_ENGINE:-}" == native ]]; then   # the native engine: no daemon, the probe drives it
     native_path

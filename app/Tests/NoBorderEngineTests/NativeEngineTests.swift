@@ -75,6 +75,39 @@ final class NativeEngineTests: XCTestCase {
         XCTAssertFalse(logs.contains { $0.hasPrefix("applying") }, "the call never ran")
     }
 
+    /// The caller is a 250 ms loop that has already written the window off as changed. A window this
+    /// engine did not change has to be handed back, or a busy app's window is never changed: the
+    /// tracker will not ask again for a window it believes is applied.
+    func testTheWindowsADeferredRunLeftUnchangedAreHandedBack() {
+        runner.outcome = CallOutcome(result: .notParked, word: nil)
+        XCTAssertEqual(engine.apply(pid: 42, windows: [3, 5]), [3, 5], "the whole batch, because none of it ran")
+        XCTAssertEqual(engine.restore(pid: 42, windows: [3, 5]), [3, 5])
+    }
+
+    func testAChangeThatHappenedHandsBackNothing() {
+        XCTAssertEqual(engine.apply(pid: 42, windows: [3]), [])
+        XCTAssertEqual(engine.restore(pid: 42, windows: [3]), [])
+    }
+
+    /// A fault is not a pause: the thread was put back, the window is as it was, and asking again
+    /// would ask the same engine to fault again. The spec's "marks the window and moves on".
+    func testAFaultIsNotADeferredWindow() {
+        runner.outcome = CallOutcome(result: .faulted, word: nil)
+        XCTAssertEqual(engine.apply(pid: 42, windows: [3]), [])
+    }
+
+    func testATargetTheEngineCannotReachIsNotADeferredWindow() {
+        runner.outcome = CallOutcome(result: .failed("task port denied"), word: nil)
+        XCTAssertEqual(engine.apply(pid: 42, windows: [3]), [])
+    }
+
+    /// A probe that could not run leaves the batch unjudged, and the next scan asks again: so the
+    /// windows are handed back, exactly as for a change that could not run.
+    func testADeferredProbeHandsTheWindowsBack() {
+        runner.probeOutcome = CallOutcome(result: .notParked, word: nil)
+        XCTAssertEqual(engine.apply(pid: 42, windows: [3]), [3])
+    }
+
     func testAFaultIsReportedAsAFailedEngineNotAsAChange() {
         runner.outcome = CallOutcome(result: .faulted, word: nil)
         engine.apply(pid: 42, windows: [3])

@@ -129,6 +129,42 @@ final class WindowTrackerTests: XCTestCase {
         XCTAssertEqual(tracker.update(windows: [window()], at: 0.9).apply, [pid: [1]])
     }
 
+    // MARK: - a batch the engine did not run
+
+    /// The loop has already emitted the apply; the app was busy, so nothing changed. The window is
+    /// still maximized and still ours to change, so the record goes away and the next scan settles
+    /// and asks again. This is the whole of "deferred, never dropped".
+    func testAWindowTheEngineDidNotApplyIsAskedAgainOnALaterScan() {
+        let tracker = WindowTracker()
+        XCTAssertEqual(settle(tracker, [window()], from: 0).apply, [pid: [1]])
+        tracker.undoApply([1])
+        XCTAssertEqual(tracker.appliedCount, 0, "we did not change it, so we do not claim it")
+        assertNothing(tracker.update(windows: [window()], at: 1.25), "the settle starts at the next scan")
+        XCTAssertEqual(tracker.update(windows: [window()], at: 1.75).apply, [pid: [1]], "asked again")
+    }
+
+    /// A restore that did not run is the other half: the window is still showing our change, so the
+    /// record goes back and the next scan asks again. Without this, a busy app's window is left
+    /// changed for good, which is the Phase 1 "windows left changed" outcome the spec says must not
+    /// exist here.
+    func testAWindowTheEngineDidNotRestoreIsAskedAgainOnALaterScan() {
+        let tracker = WindowTracker()
+        settle(tracker, [window()], from: 0)
+        assertNothing(tracker.update(windows: [window(maximized: false)], at: 2.0), "first sighting")
+        XCTAssertEqual(tracker.update(windows: [window(maximized: false)], at: 2.5).restore, [pid: [1]])
+        tracker.undoRestore([1], of: pid)
+        XCTAssertEqual(tracker.appliedCount, 1, "it is still showing our change")
+        assertNothing(tracker.update(windows: [window(maximized: false)], at: 2.75), "the settle starts at the next scan")
+        XCTAssertEqual(tracker.update(windows: [window(maximized: false)], at: 3.25).restore, [pid: [1]],
+                       "asked again, and every settle after that until it lands")
+    }
+
+    func testUndoApplyOfAWindowWeNeverSawChangesNothing() {
+        let tracker = WindowTracker()
+        tracker.undoApply([7])
+        XCTAssertEqual(tracker.appliedCount, 0, "undoing an apply cannot create a record")
+    }
+
     // MARK: - shutdown and the record cap
 
     func testRestoreAllReturnsEveryAppliedWindow() {

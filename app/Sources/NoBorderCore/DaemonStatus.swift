@@ -15,7 +15,10 @@ public enum DaemonStatus: Equatable {
         case .off: return "Off"
         case .starting: return "Starting…"
         case .stopping: return "Stopping: restoring windows…"
-        case .running(let n): return n == 1 ? "Running: 1 window squared" : "Running: \(n) windows squared"
+        // "changed", not "squared": what the engine does to a window is the outline, the corners and
+        // the titlebar rim together, in both engines. The count is the windows this app changed, which
+        // is the number the native path can know exactly — there is no external signal to infer it from.
+        case .running(let n): return n == 1 ? "Running: 1 window changed" : "Running: \(n) windows changed"
         case .note(let text): return text
         case .fatal(let reason): return "Can't run: \(reason)"
         case .crashed(let line): return line.isEmpty ? "Stopped: crashed" : "Stopped: crashed (\(line))"

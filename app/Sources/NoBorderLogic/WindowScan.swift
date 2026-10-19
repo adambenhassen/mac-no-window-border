@@ -96,6 +96,17 @@ public enum WindowScan {
                height: visibleFrame.height)
     }
 
+    /// The scan of a whole screen, reduced to what the tracker decides with: every normal window and
+    /// whether it fills one of the usable areas. This is the pairing the plan puts in the scan loop,
+    /// kept here so the geometry lives in one file; the loop takes it as an injected closure, which is
+    /// what lets the loop's tests supply their own screen.
+    public static func scan() -> [ScannedWindow] {
+        let visible = visibleFramesAsCG()
+        return normalWindows().map { window in
+            ScannedWindow(wid: window.wid, pid: window.pid, maximized: isMaximized(window.frame, in: visible))
+        }
+    }
+
     private static func number(in info: [String: Any], _ key: CFString) -> NSNumber? {
         info[key as String] as? NSNumber
     }

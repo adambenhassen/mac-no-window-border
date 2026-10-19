@@ -21,8 +21,8 @@ final class DaemonStatusTests: XCTestCase {
     }
 
     func testMenuText() {
-        XCTAssertEqual(DaemonStatus.running(windows: 1).menuText, "Running: 1 window squared")
-        XCTAssertEqual(DaemonStatus.running(windows: 2).menuText, "Running: 2 windows squared")
+        XCTAssertEqual(DaemonStatus.running(windows: 1).menuText, "Running: 1 window changed")
+        XCTAssertEqual(DaemonStatus.running(windows: 2).menuText, "Running: 2 windows changed")
         XCTAssertEqual(DaemonStatus.fatal("SIP enabled").menuText, "Can't run: SIP enabled")
         XCTAssertEqual(DaemonStatus.crashed(lastLine: "").menuText, "Stopped: crashed")
         XCTAssertEqual(DaemonStatus.crashed(lastLine: "boom").menuText, "Stopped: crashed (boom)")

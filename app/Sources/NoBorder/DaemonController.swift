@@ -170,14 +170,7 @@ final class DaemonController: ObservableObject {
     }
 
     /// ~/Library/Logs/macos-no-window-border.log, opened for appending. nil disables logging.
-    private static func openLog() -> FileHandle? {
-        let url = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Logs/macos-no-window-border.log")
-        if !FileManager.default.fileExists(atPath: url.path) {
-            guard FileManager.default.createFile(atPath: url.path, contents: nil) else { return nil }
-        }
-        guard let handle = FileHandle(forWritingAtPath: url.path) else { return nil }
-        handle.seekToEndOfFile()
-        return handle
-    }
+    /// The same file the native engine writes to; the daemon's own lines are already timestamped,
+    /// so they are written through as they arrive.
+    private static func openLog() -> FileHandle? { LogFile.open() }
 }

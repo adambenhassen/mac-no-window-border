@@ -67,6 +67,26 @@ public final class WindowTracker {
     /// The number of windows we have changed and not put back.
     public var appliedCount: Int { applied.count }
 
+    /// The engine did not apply these windows, so we have not changed them: forget the records. The
+    /// next scan sees a maximized window we do not own, settles for the apply settle, and asks again
+    /// — which is the whole of "deferred, never dropped", and the settle is the backoff.
+    public func undoApply(_ windows: [UInt32]) {
+        for wid in windows {
+            applied.removeValue(forKey: wid)
+            pending.removeValue(forKey: wid)
+        }
+    }
+
+    /// The engine did not restore these windows, so they are still showing our change: put the records
+    /// back. A window we have changed and failed to put back is the Phase 1 "windows left changed"
+    /// outcome, which the Phase 2 spec says must not exist; the next scan asks again.
+    public func undoRestore(_ windows: [UInt32], of pid: pid_t) {
+        for wid in windows {
+            applied[wid] = pid
+            pending.removeValue(forKey: wid)
+        }
+    }
+
     public func update(windows: [ScannedWindow], at now: TimeInterval) -> TrackerDecision {
         var decision = TrackerDecision()
         var seen: Set<UInt32> = []

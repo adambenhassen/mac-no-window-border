@@ -46,11 +46,13 @@ public final class NativeEngine: ChangeEngine {
         self.init(runner: ProcessRunner(), log: log)
     }
 
-    public func apply(pid: pid_t, windows: [UInt32]) {
+    @discardableResult
+    public func apply(pid: pid_t, windows: [UInt32]) -> [UInt32] {
         change(.applied(windowNumbers: windows), pid: pid, windows: windows, verb: "applying")
     }
 
-    public func restore(pid: pid_t, windows: [UInt32]) {
+    @discardableResult
+    public func restore(pid: pid_t, windows: [UInt32]) -> [UInt32] {
         change(.restored(windowNumbers: windows), pid: pid, windows: windows, verb: "restoring")
     }
 
@@ -61,43 +63,55 @@ public final class NativeEngine: ChangeEngine {
 
     deinit { shutdown() }
 
-    private func change(_ script: RemoteScript, pid: pid_t, windows: [UInt32], verb: String) {
-        guard !windows.isEmpty else { return }   // an empty batch is not a stop in someone's thread
+    @discardableResult
+    private func change(_ script: RemoteScript, pid: pid_t, windows: [UInt32], verb: String) -> [UInt32] {
         let batch = windows.map(String.init).joined(separator: " ")
+        guard !windows.isEmpty else { return [] }   // an empty batch is not a stop in someone's thread
         guard let known = appKit[pid] else {
             let probe = runner.run(.appKitProbe(), in: pid)
-            guard probe.result == .ok else { report(probe, pid: pid, batch: batch, verb: verb); return }
+            guard probe.result == .ok else { return report(probe, pid: pid, windows: windows, verb: verb) }
             let isAppKit = (probe.word ?? 0) != 0
             appKit[pid] = isAppKit
             guard isAppKit else {
                 log("skipped (not AppKit) \(pid) \(batch)")
-                return
+                return []
             }
-            change(script, pid: pid, windows: windows, verb: verb)   // now known: make the change
-            return
+            return change(script, pid: pid, windows: windows, verb: verb)   // now known: make the change
         }
         guard known else {
             log("skipped (not AppKit) \(pid) \(batch)")
-            return
+            return []
         }
-        report(runner.run(script, in: pid), pid: pid, batch: batch, verb: verb)
+        return report(runner.run(script, in: pid), pid: pid, windows: windows, verb: verb)
     }
 
     /// The one place that decides what a run means. A change that happened is named by what it is
     /// (`applying`/`restoring`); a target we could not use is named by why, and is left for the
     /// next scan; anything else is the engine's own failure.
-    private func report(_ outcome: CallOutcome, pid: pid_t, batch: String, verb: String) {
+    ///
+    /// A run that did not happen because the app was busy hands its whole batch back: the app will
+    /// park, and the window is ours to change when it does. Every other refusal is left as it is —
+    /// a faulting call, a target we cannot reach, a process with no application object will answer
+    /// the same way next time, and the log says so once.
+    @discardableResult
+    private func report(_ outcome: CallOutcome, pid: pid_t, windows: [UInt32], verb: String) -> [UInt32] {
+        let batch = windows.map(String.init).joined(separator: " ")
         switch outcome.result {
         case .ok:
             log("\(verb) \(batch)")
+            return []
         case .notParked:
             log("skipped (not parked) \(pid) \(batch)")
+            return windows
         case .faulted:
             log("engine failed \(pid) \(batch)")
+            return []
         case .timedOut:
             log("engine failed \(pid) \(batch): no completion flag")
+            return []
         case .failed(let reason):
             log("engine failed \(pid) \(batch): \(reason)")
+            return []
         }
     }
 }
