@@ -56,9 +56,23 @@ out=$($probe threadinfo $host)
 [[ "$out" == *"run_state=3"* && "$out" == *"pc=mach_msg2_trap+"* ]] \
     && note "PASS probe threadinfo: a parked run loop waits in the kernel ($out)" \
     || note "FAIL probe threadinfo: wanted run_state=3 in mach_msg2_trap, got '$out'"
+# The entry gate reads the same number: the executor only enters a thread the kernel says is asleep,
+# because a thread that has run app code since its state was read has registers we do not have.
+out=$($probe runstate $host)
+[[ "$out" == *"runstate $host 3"* ]] \
+    && note "PASS probe runstate: a parked app is asleep in the kernel ($out)" \
+    || note "FAIL probe runstate: wanted runstate 3, got '$out'"
 stop_host
 
 start_host busy
+asleep=0
+for _ (1 2 3 4 5 6 7 8 9 10); do
+    [[ "$($probe runstate $host)" != *" 3" ]] && asleep=$((asleep + 1))
+    sleep 0.1
+done
+(( asleep >= 5 )) && note "PASS probe runstate: a busy app is not asleep ($asleep/10 samples not 3)" \
+                  || note "FAIL probe runstate: a busy app read asleep too often ($asleep/10)"
+
 notparked=0
 for _ (1 2 3 4 5 6 7 8 9 10); do
     [[ "$($probe park $host)" != "park $host parked" ]] && notparked=$((notparked + 1))
@@ -75,6 +89,9 @@ for _ (1 2 3 4 5 6 7 8 9 10); do
 done
 (( became )) && note "PASS probe park: app reads parked once it goes idle" \
              || note "FAIL probe park: app never read parked after going idle"
+[[ "$($probe runstate $host)" == *"runstate $host 3"* ]] \
+    && note "PASS probe runstate: an app that goes idle is asleep again" \
+    || note "FAIL probe runstate: not asleep after going idle"
 stop_host
 
 exit $fail

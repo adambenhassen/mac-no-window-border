@@ -44,8 +44,20 @@ public final class RemoteExecutor {
     /// The result, and how long in nanoseconds the target's main thread was out of its own code —
     /// measured from ending its run-loop wait to the point the thread went back to the app, whether
     /// that was the script's last call, the fault guard's reply, or us giving up.
+    ///
+    /// `stopLimit` bounds the wait for the script once it is running; `enterLimit` bounds the search
+    /// for a moment when the thread is asleep in its run loop and stays that way. A target that never
+    /// settles comes back `.notParked`, which is the same answer the park check gives and means the
+    /// same thing: try again later. Only the time between entering and finishing is the app's stall,
+    /// which is what the phase is measured on; looking for a parked moment is free for the app —
+    /// reading `run_state` costs it nothing it was not already doing.
+    ///
+    /// The generous `enterLimit` is not padding: AppKit's own work after these calls (re-compositing
+    /// a full-screen window's shadow and titlebar) keeps its main thread busy for hundreds of
+    /// milliseconds, sometimes seconds, and a target that busy is simply not servable yet.
     public func run(_ script: RemoteScript, on main: MainThread, addresses: AddressTable,
-                   stopLimit: TimeInterval = 0.2) -> (result: RunResult, stopNanoseconds: Int) {
+                   stopLimit: TimeInterval = 0.2, enterLimit: TimeInterval = 2.5)
+                   -> (result: RunResult, stopNanoseconds: Int) {
         guard let parked = main.state() else { return (.failed("could not read the thread state"), 0) }
         guard task.parkState(from: parked) == .parked else { return (.notParked, 0) }
 
@@ -70,24 +82,45 @@ public final class RemoteExecutor {
         enter.__sp = stackTop                                  // 16-aligned, as the ABI requires
         enter.__fp = 0
         enter.__lr = 0
-        guard main.setState(enter) else {
-            return (.failed("could not enter the call script"), elapsedSince(started))
-        }
 
         // A parked thread is inside a system call, in the kernel, and a new pc does nothing to it
         // there: it stays in TH_WAIT and the change is never applied. Ending the call makes the
         // kernel return it to user space, which is where it picks the new pc up. If the call cannot
         // be ended we put the thread's state back and leave it alone.
-        let underOurControl = DispatchTime.now().uptimeNanoseconds
         let faults = FaultGuard(task: task)
         guard faults.install() else {
-            _ = main.setState(parked)
             return (.failed("could not install the fault guard"), elapsedSince(started))
         }
-        guard thread_abort(main.port) == KERN_SUCCESS else {
-            _ = main.setState(parked)
+        // The state above is the app's own only while the thread is still asleep inside its
+        // run-loop call. Anything that wakes it — a timer, an event — and the app has been running
+        // its own code with its own registers; entering then runs the script in the middle of that,
+        // and the state handed back afterwards belongs to a frame the app has left. Measured: the
+        // app jumps to a signed return address and dies in EXC_BAD_ACCESS. So the entry is retried
+        // until the thread is found asleep again, and a target that will not settle is left alone.
+        var underOurControl: UInt64 = 0
+        var entered = false
+        while DispatchTime.now().uptimeNanoseconds < started + UInt64(enterLimit * 1_000_000_000) {
+            // The one window that matters: between reading the state and ending the call, the app must
+            // not have run any of its own code. Checking costs a thread_info call; if the app is
+            // awake, the state we saved is not its state, so ask again shortly.
+            guard main.runState() == MainThread.asleepRunState else { usleep(200); continue }
+            guard main.setState(enter) else {
+                faults.remove()
+                return (.failed("could not enter the call script"), elapsedSince(started))
+            }
+            underOurControl = DispatchTime.now().uptimeNanoseconds
+            guard thread_abort(main.port) == KERN_SUCCESS else {
+                _ = main.setState(parked)   // the thread is asleep; this is its state back
+                continue
+            }
+            entered = true
+            break
+        }
+        guard entered else {
             faults.remove()
-            return (.failed("could not end the run loop's wait"), elapsedSince(started))
+            // The app was never taken out of its own code, so it was not stopped: the phase measures
+            // that number, and 0 is the honest answer for a target we only looked at.
+            return (.notParked, 0)
         }
         let result = waitForCompletion(at: flagAddress, deadline: underOurControl + UInt64(stopLimit * 1_000_000_000),
                                       faults: faults, on: main, restoringTo: backToTheApp)

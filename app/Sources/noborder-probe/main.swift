@@ -1,7 +1,7 @@
 import Foundation
 import NoBorderEngine
 
-let usage = "usage: noborder-probe taskport|mainthread|park|threadinfo <pid> | run <pid> <wid> applied|restored [fault] | apply|restore <pid> <wid>…"
+let usage = "usage: noborder-probe taskport|mainthread|park|threadinfo|runstate <pid> | run <pid> <wid> applied|restored [fault] | apply|restore <pid> <wid>…"
 let args = CommandLine.arguments
 guard args.count >= 3, let pid = Int32(args[2]) else {
     print(usage)
@@ -68,6 +68,13 @@ case "threadinfo":
     }
     guard kr == KERN_SUCCESS, let state = main.state() else { fail("threadinfo \(pid) kr=\(kr)") }
     print("threadinfo \(pid) run_state=\(info.run_state) flags=\(info.flags) pc=\(describe(address: state.__pc))")
+case "runstate":
+    // The entry gate's input: the kernel's own answer about the thread. 3 (TH_WAIT) is the parked
+    // run loop; a thread that has woken and is running app code is not 3, and the state read a
+    // moment earlier is no longer the state that thread has.
+    guard let main = task.mainThread() else { fail("runstate \(pid) no-main-thread") }
+    guard let state = main.runState() else { fail("runstate \(pid) unreadable") }
+    print("runstate \(pid) \(state)")
 case "run":
     guard args.count >= 5, args.count <= 6, let wid = UInt32(args[3]) else { print(usage); exit(2) }
     if args.count == 6, args[5] != "fault" { print(usage); exit(2) }

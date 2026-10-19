@@ -13,11 +13,30 @@ public struct MainThread {
     public let port: thread_act_t
     /// The system-wide thread id from the kernel, comparable across processes.
     public let id: UInt64
+
+    /// `TH_WAIT` from <mach/machine/thread_status.h>: the thread is asleep in the kernel, which is
+    /// what a run loop waiting in `mach_msg2_trap` reports. The SDK does not export the kernel's
+    /// run-state constants to Swift; tests/probe.sh prints the number for a parked app and gets 3.
+    public static let asleepRunState: Int32 = 3
 }
 
 extension MainThread {
     public func suspend() { thread_suspend(port) }
     public func resume() { thread_resume(port) }
+
+    /// What the kernel says the thread is doing. A thread parked in its run loop's mach call reports
+    /// TH_WAIT; one that has woken and is running app code reports TH_RUN. This is the only way to
+    /// know that the state read a moment ago is still the state the thread has.
+    public func runState() -> Int32? {
+        var info = thread_basic_info()
+        var count = mach_msg_type_number_t(MemoryLayout<thread_basic_info>.size / MemoryLayout<integer_t>.size)
+        let kr = withUnsafeMutablePointer(to: &info) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                thread_info(port, thread_flavor_t(THREAD_BASIC_INFO), $0, &count)
+            }
+        }
+        return kr == KERN_SUCCESS ? info.run_state : nil
+    }
 
     public func state() -> arm_thread_state64_t? {
         var state = arm_thread_state64_t()
