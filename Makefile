@@ -17,7 +17,14 @@ app: winscan build/AppIcon.icns
 	cp app/Info.plist $(APP)/Contents/Info.plist
 	cp app/.build/release/NoBorder $(APP)/Contents/MacOS/NoBorder
 	cp noborder.py windowstate.py winscan build/AppIcon.icns $(APP)/Contents/Resources/
-	codesign --force --sign - $(APP)
+	codesign --force --sign - --entitlements app/Entitlements.plist $(APP)
+
+# Development binary for driving the native engine by hand (tests/probe.sh drives it).
+probe:
+	cd app && swift build
+	mkdir -p build
+	cp app/.build/debug/noborder-probe build/noborder-probe
+	codesign --force --sign - --entitlements app/Entitlements.plist build/noborder-probe
 
 release: app
 	rm -f build/NoBorder.zip
@@ -30,6 +37,8 @@ install: app
 test:
 	python3 -m unittest discover -s tests -v
 	cd app && swift test
+	$(MAKE) testtools probe
+	tests/probe.sh
 
 testtools: tests/hostapp tests/winpixels
 
@@ -42,4 +51,4 @@ tests/winpixels: tests/winpixels.c
 clean:
 	rm -rf winscan build app/.build tests/hostapp tests/winpixels
 
-.PHONY: all app release install test testtools clean
+.PHONY: all app probe release install test testtools clean
