@@ -335,14 +335,13 @@
 
   <section>
     <h2>Only maximized windows</h2>
-    <p>A window counts as maximized when it fills its screen's usable area: below the menu bar, beside the Dock. Every other window keeps the normal macOS look. A window gets its normal look back when you un-maximize it, turn NoBorder off, or quit it, unless its app stays busy. A busy app's windows can stay changed if the app is busy when NoBorder quits.</p>
+    <p>A window counts as maximized when it fills its screen's usable area: below the menu bar, beside the Dock. Every other window keeps the normal macOS look. A window gets its normal look back when you un-maximize it, turn NoBorder off, or quit it. If its app is busy at that moment, NoBorder asks again on a later scan — a window is deferred, never dropped.</p>
   </section>
 
   <section>
     <h2>Requirements</h2>
     <ul>
-      <li><strong>System Integrity Protection disabled.</strong> NoBorder attaches a debugger to Dock and to your apps, which SIP forbids. Disabling SIP weakens macOS security; read <a href="https://developer.apple.com/documentation/security/disabling-and-enabling-system-integrity-protection">Apple's guide</a> before you do it.</li>
-      <li><strong>Xcode installed.</strong> NoBorder uses the LLDB that ships with it.</li>
+      <li><strong>System Integrity Protection disabled.</strong> NoBorder changes windows from inside your apps, which means opening their task ports as your normal user, and SIP forbids that. Disabling SIP weakens macOS security; read <a href="https://developer.apple.com/documentation/security/disabling-and-enabling-system-integrity-protection">Apple's guide</a> before you do it.</li>
       <li><strong>macOS 14 or later.</strong> Tested on macOS 15.</li>
     </ul>
   </section>
@@ -368,22 +367,28 @@ cd mac-no-window-border
 make install
 open /Applications/NoBorder.app</code></pre>
     </div>
-    <p>The menu bar icon shows the status and has <em>Enabled</em>, <em>Launch at Login</em> and <em>Quit</em>.</p>
+    <p>The menu bar icon shows the status, the engine a run is using, and has <em>Enabled</em>, <em>Launch at Login</em> and <em>Quit</em>.</p>
+    <p><strong>Upgrading from v1.1:</strong> quit v1.1 from its own menu before you install 2.0. v1.1
+    removed the outline by tagging windows through Dock; 2.0 removes it inside each app and makes no
+    tag calls, so it cannot undo a tag v1.1 left behind. If it died, was killed, or the machine
+    rebooted, reopen the affected apps' windows once.</p>
   </section>
 
   <section>
     <h2>Costs and limits</h2>
     <ul>
-      <li>An app freezes for about a second each time one of its windows becomes or stops being maximized.</li>
-      <li>NoBorder leaves an app alone for its first 30 seconds after launch.</li>
+      <li>A window changes when its app's main thread is next idle. The change is a short sequence of AppKit calls inside that app, not a debugger pause, and it is not something you feel. The AppKit calls keep that app's main loop busy for hundreds of milliseconds on a full-screen window; the same work in v1.1 cost a ~3.5 s stop.</li>
+      <li>Nothing runs inside a busy app, so a window of a busy app changes when that app next parks. It is asked about again for as long as it needs the change, with no cap and no giving up.</li>
+      <li>If an app puts its own outline back, NoBorder cannot see it: the shadow state lives in the app. Reopening the window, moving it, or toggling NoBorder applies it again.</li>
+      <li>Quitting, turning NoBorder off, and the app being terminated ask every app to put its windows back. A <code>kill -9</code> leaves them changed.</li>
       <li>Only AppKit windows change corners. That includes Chromium and Electron apps.</li>
-      <li>NoBorder uses private macOS APIs, so a macOS update can break it.</li>
+      <li>NoBorder uses private macOS APIs, so a macOS update can break it. A missing method means that one step is skipped, not that an app crashes.</li>
     </ul>
   </section>
 
   <section>
     <h2>How it works</h2>
-    <p>A small daemon keeps an LLDB session attached to Dock and calls WindowServer from inside it to set each maximized window's no-shadow tag, which removes the outline. For corners and the rim, it briefly attaches to the window's app and queues two AppKit calls on the app's main run loop. Details are in the <a href="https://github.com/adambenhassen/mac-no-window-border#readme">README</a>.</p>
+    <p>NoBorder.app is the whole product: no daemon, no debugger, no child process. The app reads the window list, decides which windows to change, and makes the changes inside the app that owns each window — in that app's own main thread, only while that thread is parked in its run loop. It writes generated arm64 code into the app, ends the kernel call the thread is parked in so the kernel returns it to that code, and the code calls <code>setHasShadow:</code>, <code>_setCornerRadius:</code> and the titlebar's <code>drawsDecorationView</code>, then restores the app's registers and jumps back to the start of the run-loop wait it was in — so the app is never left in the middle of a call. Details are in the <a href="https://github.com/adambenhassen/mac-no-window-border#readme">README</a>.</p>
   </section>
 </main>
 
