@@ -10,5 +10,6 @@ let package = Package(
         .executableTarget(name: "noborder-probe", dependencies: ["NoBorderEngine"]),
         .executableTarget(name: "NoBorder", dependencies: ["NoBorderCore", "NoBorderEngine"]),
         .testTarget(name: "NoBorderCoreTests", dependencies: ["NoBorderCore"]),
+        .testTarget(name: "NoBorderEngineTests", dependencies: ["NoBorderEngine"]),
     ]
 )
