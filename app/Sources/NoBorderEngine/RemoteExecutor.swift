@@ -29,8 +29,13 @@ public final class RemoteExecutor {
     private static let stackBytes = 16 * 1024
 
     /// What the completion flag holds before a run: the script writes zero there, so zero after a
-    /// run means it was this run that wrote it.
+    /// run means it was this run that wrote it. The same sentinel marks the result word unread.
     private static let flagNotDone: UInt64 = 0xFFFF_FFFF_FFFF_FFFF
+
+    /// The word the last script that finished wrote at `Trampoline.resultOffset`, or nil if it wrote
+    /// none. Read after a run, never while one is in progress; a run that did not finish leaves the
+    /// sentinel there, which reads as nil.
+    public private(set) var lastResultWord: UInt64?
 
     public init(task: TargetTask) { self.task = task }
 
@@ -87,6 +92,7 @@ public final class RemoteExecutor {
         let result = waitForCompletion(at: flagAddress, deadline: underOurControl + UInt64(stopLimit * 1_000_000_000),
                                       faults: faults, on: main, restoringTo: backToTheApp)
         faults.remove()
+        lastResultWord = result == .ok ? readResultWord() : nil
         // Once the thread is back with the app — the script's own jump, or our reply to a fault —
         // the stop is over. Anything else (a timeout, a target that went away) is counted from the
         // start, because we do not know when, or whether, it came back.
@@ -107,7 +113,10 @@ public final class RemoteExecutor {
         }
     }
 
-    private var stackTop: UInt64 { stackBase + UInt64(Self.stackBytes) - 16 }
+    /// The stack pointer the script starts on: 16-aligned, as the ABI requires, and 32 bytes below
+    /// the top of the region so the two words it writes (the completion flag at +8 and the result at
+    /// +16) are inside it. The calls grow down from here, so nothing they touch is a word we read.
+    private var stackTop: UInt64 { stackBase + UInt64(Self.stackBytes) - 32 }
 
     /// The word the script zeroes when its last call has returned. It is above the stack the calls
     /// use, so nothing else writes there.
@@ -128,11 +137,23 @@ public final class RemoteExecutor {
         return .timedOut
     }
 
+    /// The word the script hands back to us, beside the completion flag and above the stack its
+    /// calls use, so nothing else writes there.
+    private var resultAddress: UInt64 { stackTop + UInt64(Trampoline.resultOffset) }
+
     private func markFlagUnfinished() -> Bool {
         var sentinel = Self.flagNotDone
         return withUnsafeBytes(of: &sentinel) { buffer in
+            // Both words at once: a result word left over from a previous run would be read as if
+            // this script had written it.
             write(bytes: buffer.baseAddress!, count: buffer.count, at: flagAddress)
+                && write(bytes: buffer.baseAddress!, count: buffer.count, at: resultAddress)
         }
+    }
+
+    private func readResultWord() -> UInt64? {
+        let value = task.readWord(at: resultAddress)
+        return value == Self.flagNotDone ? nil : value
     }
 
     /// The address of the function an address inside it belongs to — for a parked thread that is

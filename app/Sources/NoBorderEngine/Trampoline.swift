@@ -44,6 +44,13 @@ public enum Arc64 {
         return 0xF900_0000 | (UInt32(offset >> 3) << 10) | (UInt32(base & 0x1F) << 5) | 31
     }
 
+    /// str x<s>, [x<b>, #<offset>] — the one way a script hands a value back to us; the AppKit
+    /// probe writes the app object it found.
+    public static func str(src: Int, base: Int, offset: Int) -> UInt32 {
+        precondition(offset % 8 == 0 && offset >= 0 && offset < 64 * 1024)
+        return 0xF900_0000 | (UInt32(offset >> 3) << 10) | (UInt32(base & 0x1F) << 5) | UInt32(src & 0x1F)
+    }
+
     /// mov sp, x<r> — the app's stack pointer, put back before we jump to its code.
     public static func movSp(from register: Int) -> UInt32 {
         0x9100_0000 | (UInt32(register & 0x1F) << 5) | 31
@@ -80,6 +87,11 @@ public enum Trampoline {
     /// When every call has returned, the script writes zero at this offset from the stack pointer it
     /// was given. The caller polls that word instead of touching the thread again.
     public static let completionFlagOffset = 8
+
+    /// The word a probe script writes: the value it was asked to look up. It is written while the
+    /// script is still running, so it is only trustworthy once the completion flag says it is done —
+    /// which is why the executor marks both words before every run.
+    public static let resultOffset = 16
 
     static let applicationClass = "NSApplication"
     static let sharedApplicationSelector = "sharedApplication"
@@ -131,12 +143,14 @@ public enum Trampoline {
         case move(dst: Int, src: Int)
         case call(reg: Int)
         case storeCompletionFlag
+    case storeResult(from: Int)
         case moveStackPointer(from: Int)
         case branch(to: Int)
     }
 
     /// The selectors this script needs, in the order they are resolved into registers.
     private static func selectors(_ script: RemoteScript) -> [String] {
+        if script.appKitProbe { return [] }   // it sends one message, and its selector is listed apart
         var names = [lookupSelector]
         if script.hasShadow != nil { names.append(hasShadowSelector) }
         if script.cornerRadius != nil { names.append(cornerRadiusSelector) }
@@ -167,6 +181,8 @@ public enum Trampoline {
                 words.append(Arc64.blr(reg))
             case .storeCompletionFlag:
                 words.append(Arc64.strZero(base: 31, offset: completionFlagOffset))
+            case .storeResult(let src):
+                words.append(Arc64.str(src: src, base: 31, offset: resultOffset))
             case .moveStackPointer(let from):
                 words.append(Arc64.movSp(from: from))
             case .branch(let register):
@@ -215,6 +231,12 @@ public enum Trampoline {
         ops.append(.move(dst: 0, src: appRegister))
         ops.append(.call(reg: msgSendRegister))
         ops.append(.move(dst: appRegister, src: 0))
+        if script.appKitProbe {
+            // The whole point of a probe script: hand back the application object, which is nil in a
+            // process with no AppKit. Written before the completion flag, so a caller that read the
+            // flag can trust it.
+            ops.append(.storeResult(from: appRegister))
+        }
         // one selector lookup per message the script sends
         for (index, name) in selectorNames.enumerated() {
             ops.append(.loadFromBlob(dst: selLookupRegister, blobOffset: blob.selRegisterName))

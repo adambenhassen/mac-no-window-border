@@ -1,7 +1,7 @@
 import Foundation
 import NoBorderEngine
 
-let usage = "usage: noborder-probe taskport|mainthread|park|threadinfo <pid> | run <pid> <wid> applied|restored [fault]"
+let usage = "usage: noborder-probe taskport|mainthread|park|threadinfo <pid> | run <pid> <wid> applied|restored [fault] | apply|restore <pid> <wid>…"
 let args = CommandLine.arguments
 guard args.count >= 3, let pid = Int32(args[2]) else {
     print(usage)
@@ -85,6 +85,17 @@ case "run":
     if case .failed(let reason) = result { line += " reason=\(reason)" }
     print(line)
     exit(result == .ok ? 0 : 1)
+case "apply", "restore":
+    // The engine, one batch of windows in one process. What it decided is on stdout as log lines;
+    // the exit code says whether the batch was applied, which is all a caller outside the test needs.
+    let numbers = args.dropFirst(3).compactMap { UInt32($0) }
+    guard numbers.count == args.count - 3 else { print(usage); exit(2) }
+    let verb = args[1] == "apply" ? "applying" : "restoring"
+    var lines: [String] = []
+    let engine = NativeEngine(log: { print($0); lines.append($0) })
+    if args[1] == "apply" { engine.apply(pid: pid, windows: numbers) } else { engine.restore(pid: pid, windows: numbers) }
+    engine.shutdown()
+    exit(lines.contains { $0.hasPrefix(verb) } ? 0 : 1)
 default:
     print(usage)
     exit(2)

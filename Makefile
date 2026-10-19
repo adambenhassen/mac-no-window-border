@@ -41,7 +41,7 @@ test:
 	tests/probe.sh
 	tests/engine.sh
 
-testtools: tests/hostapp tests/winpixels
+testtools: tests/hostapp tests/winpixels tests/pxband tests/wbounds tests/plainrunloop
 
 tests/hostapp: tests/hostapp.swift
 	swiftc -O -o $@ $<
@@ -49,7 +49,19 @@ tests/hostapp: tests/hostapp.swift
 tests/winpixels: tests/winpixels.c
 	clang -O2 -Wall -o $@ $< -framework CoreGraphics -framework ImageIO -framework CoreFoundation
 
+# Strip comparison across a window's edge: the outline check (tests/e2e.sh).
+tests/pxband: tests/pxband.c
+	clang -O2 -Wall -o $@ $< -framework CoreGraphics -framework ImageIO -framework CoreFoundation
+
+# A window's rectangle, to place that strip.
+tests/wbounds: tests/wbounds.m
+	clang -O2 -Wall -fobjc-arc -o $@ $< -framework AppKit -framework CoreGraphics
+
+# A main run loop with no AppKit: the target the native engine must refuse.
+tests/plainrunloop: tests/plainrunloop.swift
+	swiftc -O -o $@ $<
+
 clean:
-	rm -rf winscan build app/.build tests/hostapp tests/winpixels
+	rm -rf winscan build app/.build tests/hostapp tests/winpixels tests/pxband tests/wbounds tests/plainrunloop
 
 .PHONY: all app probe release install test testtools clean

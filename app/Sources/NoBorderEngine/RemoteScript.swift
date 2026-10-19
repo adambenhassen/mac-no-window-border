@@ -12,6 +12,11 @@ public struct RemoteScript: Equatable {
     /// Test-only: makes the generated code jump to an address no process has mapped, so the fault
     /// guard has something to catch. Product code never sets it and nothing sets it by default.
     public var forceFaultForTesting = false
+    /// A script that only looks the application object up and writes it back to us. Its purpose is
+    /// to answer one question before any window is touched: is this process an AppKit app at all?
+    /// `objc_getClass("NSApplication")`/`sharedApplication` is nil in a process without AppKit —
+    /// which is exactly what the generated code would silently do nothing about.
+    public var appKitProbe = false
 
     public init(windowNumbers: [UInt32], hasShadow: Bool?, cornerRadius: Double?, drawsDecoration: Bool?) {
         self.windowNumbers = windowNumbers
@@ -28,6 +33,13 @@ public struct RemoteScript: Equatable {
     /// Back to exactly what AppKit had before: shadow on, default corner radius, rim drawn.
     public static func restored(windowNumbers: [UInt32]) -> RemoteScript {
         RemoteScript(windowNumbers: windowNumbers, hasShadow: true, cornerRadius: 0.0, drawsDecoration: true)
+    }
+
+    /// Ask the target for its application object and nothing else.
+    public static func appKitProbe() -> RemoteScript {
+        var script = RemoteScript(windowNumbers: [], hasShadow: nil, cornerRadius: nil, drawsDecoration: nil)
+        script.appKitProbe = true
+        return script
     }
 }
 

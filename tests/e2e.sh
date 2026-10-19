@@ -34,6 +34,92 @@ tagcount() {  # tagcount <log> <wid>: number of "tagging" log lines that name <w
     awk -v w=$2 '$3=="tagging" { for (i = 4; i <= NF; i++) if ($i == w) { n++; break } } END { print n + 0 }' $1
 }
 
+strip() {  # strip <png>: capture a 40 px strip across the maximized window's left edge
+    typeset x y w h
+    read _ x y w h < <(tests/wbounds $max)
+    # y+150 and h-400 keep the strip away from the corners and the titlebar, so what it can show is
+    # the outline along the left edge — nothing else changes over that span.
+    screencapture -x -o -R"$x,$(( y + 150 )),40,$(( h - 400 ))" $1
+}
+
+edge() {  # edge <a.png> <b.png>: the two edge columns of a strip comparison
+    tests/pxband $1 $2 $edgeThr 0 2
+}
+
+edgeVerdict() {  # edgeVerdict <pxband line>: tall (edge changed over almost the whole strip),
+                 # edge (both edge columns moved), clean (nothing at all differs)
+    print -r -- "$1" | awk '
+    {   h = 0; rows = -1; split("", c)
+        for (i = 1; i <= NF; i++) {
+            f = $i
+            if (f ~ /^height=/)        { sub(/^height=/, "", f);        h = f + 0 }
+            else if (f ~ /^rows_with_diff=/) { sub(/^rows_with_diff=/, "", f); rows = f + 0 }
+            else { sub(/^cols=/, "", f)
+                   if (f ~ /^[0-9]+:[0-9]+$/) { split(f, kv, ":"); c[kv[1]] = kv[2] + 0 } }
+        }
+        printf "tall=%d edge=%d clean=%d", (rows >= 0.9 * h), (c[0] > 0 && c[1] > 0), (rows == 0)
+    }'
+}
+
+edgeThr=32
+
+native_path() {  # the native engine, driven through the probe, verified on pixels
+    typeset out=build/e2e
+    [[ -f build/noborder-probe ]] || { echo "FAIL no build/noborder-probe (make probe)"; fail=1; return; }
+
+    strip $out/pre.png
+    log=$out/native.log
+    build/noborder-probe apply $host $max > $log 2>&1
+    grep -q "^applying $max" $log && echo "PASS native logs applying: $(head -1 $log)" \
+        || echo "FAIL native did not log applying: $(head -3 $log)"
+    grep -q "^applying $max" $log || fail=1
+
+    # corners and rim, the same reading the legacy path uses
+    probe_px
+    [[ "$px" == "square=1 rim=0" ]] && echo "PASS native applied on pixels: $px" \
+        || { echo "FAIL native applied on pixels: got '$px', want 'square=1 rim=0'"; fail=1; }
+    # Spec finding 3: winscan's shadow column keeps reporting a shadow after the outline is gone. It
+    # is printed here to show the native path never consults it: every decision above is pixels.
+    echo "note winscan after native apply (not a signal): $(./winscan --all | awk -F'\t' -v w=$max '$1==w {print $(NF-1), $NF}')"
+
+    # The outline itself: the left edge of the window, over almost the whole strip height.
+    strip $out/applied.png
+    band=$(edge $out/pre.png $out/applied.png)
+    verdict=$(edgeVerdict $band)
+    [[ "$verdict" == "tall=1 edge=1 clean=0" ]] && echo "PASS native changed the outline: $band" \
+        || { echo "FAIL native outline unchanged: $band ($verdict)"; fail=1; }
+
+    build/noborder-probe restore $host $max > $out/native-restore.log 2>&1
+    grep -q "^restoring $max" $out/native-restore.log && echo "PASS native logs restoring: $(head -1 $out/native-restore.log)" \
+        || { echo "FAIL native did not log restoring: $(head -3 $out/native-restore.log)"; fail=1; }
+    probe_px
+    [[ "$px" == "square=0 rim=1" ]] && echo "PASS native restored on pixels: $px" \
+        || { echo "FAIL native restored on pixels: got '$px', want 'square=0 rim=1'"; fail=1; }
+    strip $out/restored.png
+    band=$(edge $out/pre.png $out/restored.png)
+    verdict=$(edgeVerdict $band)
+    [[ "$verdict" == *"clean=1"* ]] && echo "PASS native restore returns the original edge: $band" \
+        || { echo "FAIL native restore left the edge changed: $band ($verdict)"; fail=1; }
+
+    # Review Focus: a target that is not an AppKit app. It has no window to check, so the assertion
+    # is that the engine says why it stopped, and that hostapp's window is left as it was.
+    tests/plainrunloop > $out/plain.txt & plain=$!
+    for _ in {1..20}; do [[ -s $out/plain.txt ]] && break; sleep 0.25; done
+    build/noborder-probe apply $plain 4242 > $out/plain.log 2>&1
+    grep -q "skipped (not AppKit) $plain" $out/plain.log \
+        && echo "PASS native skips a target that is not AppKit: $(head -1 $out/plain.log)" \
+        || { echo "FAIL native on a non-AppKit target: $(head -3 $out/plain.log)"; fail=1; }
+    kill $plain 2>/dev/null; wait $plain 2>/dev/null
+    probe_px
+    [[ "$px" == "square=0 rim=1" ]] && echo "PASS non-AppKit target left the window alone: $px" \
+        || { echo "FAIL non-AppKit target changed the window: $px"; fail=1; }
+}
+
+probe_px() {  # probe_px: sets px from a window capture of the maximized window
+    screencapture -x -o -l $max $out/w.png
+    px=$(tests/winpixels $out/w.png)
+}
+
 host=""
 daemon=""
 parent=""
@@ -60,6 +146,12 @@ max=$(awk '$1=="max" {print $2}' $out/host.txt)
 float=$(awk '$1=="floating" {print $2}' $out/host.txt)
 
 export NOBORDER_GRACE_S=0  # the test app was just launched
+
+if [[ "${NOBORDER_ENGINE:-}" == native ]]; then   # the native engine: no daemon, the probe drives it
+    native_path
+    exit $fail
+fi
+
 ./noborder.py --pids $host > $out/daemon.log 2>&1 & daemon=$!
 check "maximized applied" $max "[noshadow] [max]" "square=1 rim=0"
 before=$(tagcount $out/daemon.log $max)

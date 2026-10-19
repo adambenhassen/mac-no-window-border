@@ -207,6 +207,28 @@ final class TrampolineTests: XCTestCase {
         XCTAssertLessThan(at, code.count - 1, "the flag must be written before the app gets the thread back")
     }
 
+    // MARK: the AppKit probe
+
+    func testTheProbeAsksForTheApplicationObjectAndNothingElse() {
+        let code = self.code(.appKitProbe())
+        let calls = code.filter { $0 == Arc64.blr(Trampoline.classLookupRegister)
+            || $0 == Arc64.blr(Trampoline.selLookupRegister)
+            || $0 == Arc64.blr(Trampoline.msgSendRegister) }.count
+        XCTAssertEqual(calls, 3, "objc_getClass, one selector lookup, one message — no window work")
+        let store = Arc64.str(src: Trampoline.appRegister, base: 31, offset: Trampoline.resultOffset)
+        guard let at = code.firstIndex(of: store) else { return XCTFail("the probe never writes its answer") }
+        let flag = code.firstIndex(of: Arc64.strZero(base: 31, offset: Trampoline.completionFlagOffset))
+        XCTAssertLessThan(at, flag!, "the answer is written before the flag says the script is done")
+    }
+
+    func testTheProbeCarriesNoWindowSelectors() {
+        let data = self.blob(.appKitProbe())
+        XCTAssertFalse(hasCString(data, Trampoline.lookupSelector))
+        XCTAssertFalse(hasCString(data, Trampoline.hasShadowSelector))
+        XCTAssertFalse(hasCString(data, Trampoline.cornerRadiusSelector))
+        XCTAssertTrue(hasCString(data, Trampoline.sharedApplicationSelector), "it does ask for the app")
+    }
+
     func testSkippedStepsMakeFewerCalls() {
         var script = RemoteScript.applied(windowNumbers: [7])
         script.cornerRadius = nil
@@ -260,6 +282,7 @@ final class TrampolineTests: XCTestCase {
             "mov x0, x19",
             "blr x16",
             "str xzr, [sp, #8]",
+            "str x21, [sp, #16]",
             "ldr x16, [x19, #512]",
             "mov sp, x17",
             "br x17",
@@ -272,6 +295,7 @@ final class TrampolineTests: XCTestCase {
             Arc64.movReg(dst: 0, src: 19),
             Arc64.blr(16),
             Arc64.strZero(base: 31, offset: 8),
+            Arc64.str(src: 21, base: 31, offset: 16),
             Arc64.ldr(dst: 16, base: 19, offset: 512),
             Arc64.movSp(from: 17),
             Arc64.br(17),
