@@ -49,6 +49,13 @@ for _ (1 2 3 4 5); do
 done
 (( parked >= 1 )) && note "PASS probe park: idle app reads parked ($parked/5)" \
                   || note "FAIL probe park: idle app never read parked"
+
+# What "parked" is, at the machine level: the thread waits *inside the kernel*, in the run loop's
+# Mach call (run_state=3 is TH_WAIT). The executor has to end that call to run anything.
+out=$($probe threadinfo $host)
+[[ "$out" == *"run_state=3"* && "$out" == *"pc=mach_msg2_trap+"* ]] \
+    && note "PASS probe threadinfo: a parked run loop waits in the kernel ($out)" \
+    || note "FAIL probe threadinfo: wanted run_state=3 in mach_msg2_trap, got '$out'"
 stop_host
 
 start_host busy

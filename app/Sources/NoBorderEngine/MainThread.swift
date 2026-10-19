@@ -15,6 +15,47 @@ public struct MainThread {
     public let id: UInt64
 }
 
+extension MainThread {
+    public func suspend() { thread_suspend(port) }
+    public func resume() { thread_resume(port) }
+
+    public func state() -> arm_thread_state64_t? {
+        var state = arm_thread_state64_t()
+        var count = mach_msg_type_number_t(MemoryLayout<arm_thread_state64_t>.size / MemoryLayout<integer_t>.size)
+        let kr = withUnsafeMutablePointer(to: &state) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                thread_get_state(port, thread_state_flavor_t(ARM_THREAD_STATE64), $0, &count)
+            }
+        }
+        return kr == KERN_SUCCESS ? state : nil
+    }
+
+    public func setState(_ state: arm_thread_state64_t) -> Bool {
+        var mutable = state
+        let count = mach_msg_type_number_t(MemoryLayout<arm_thread_state64_t>.size / MemoryLayout<integer_t>.size)
+        return withUnsafeMutablePointer(to: &mutable) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                thread_set_state(port, thread_state_flavor_t(ARM_THREAD_STATE64), $0, count)
+            }
+        } == KERN_SUCCESS
+    }
+}
+
+/// The app's own thread state, for the generated code to put back before it jumps away.
+extension ThreadHandback {
+    /// `restartAt` is the *start* of the call the thread was sitting in: a parked thread's pc is
+    /// the instruction after the trap, and returning there would hand CoreFoundation the result of
+    /// a call it never made.
+    public init(from state: arm_thread_state64_t, restartAt: UInt64) {
+        var registers: [UInt64] = []
+        withUnsafeBytes(of: state) { raw in
+            // x0…x28, then x29 (fp) and x30 (lr): 31 words, flat, at the start of the struct.
+            for index in 0..<31 { registers.append(raw.load(fromByteOffset: index * 8, as: UInt64.self)) }
+        }
+        self.init(registers: registers, sp: state.__sp, pc: restartAt)
+    }
+}
+
 extension TargetTask {
     private static let idleTraps: Set<String> = ["mach_msg2_trap", "mach_msg_trap"]
     private static let runLoopPortFrame = "__CFRunLoopServiceMachPort"
@@ -55,15 +96,13 @@ extension TargetTask {
     }
 
     public func parkState(of main: MainThread) -> ParkState {
-        var state = arm_thread_state64_t()
-        var count = mach_msg_type_number_t(MemoryLayout<arm_thread_state64_t>.size / MemoryLayout<integer_t>.size)
-        let kr = withUnsafeMutablePointer(to: &state) { pointer in
-            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
-                thread_get_state(main.port, thread_state_flavor_t(ARM_THREAD_STATE64), $0, &count)
-            }
-        }
-        guard kr == KERN_SUCCESS else { return .unknown }
+        guard let state = main.state() else { return .unknown }
+        return parkState(from: state)
+    }
 
+    /// The decision for a thread state we have already read. The executor reads it with the thread
+    /// stopped, so the answer cannot change underneath the decision.
+    public func parkState(from state: arm_thread_state64_t) -> ParkState {
         guard let innerFrame = symbolName(at: state.__pc), Self.idleTraps.contains(innerFrame) else {
             return .running
         }

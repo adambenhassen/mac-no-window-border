@@ -28,16 +28,50 @@ public struct RemoteScript: Equatable {
     }
 }
 
+/// The state to hand the thread back to once the calls are done: the app's own registers, its
+/// stack pointer, and the instruction it was about to run. The generated code restores these from
+/// its data and jumps there, so the app takes itself back — no second stop, no second round trip.
+public struct ThreadHandback: Equatable {
+    /// x0…x30 as the app had them (x29 is the frame pointer, x30 the link register).
+    public var registers: [UInt64]
+    public var sp: UInt64
+    /// The address to run next: the start of the run-loop call the thread was sitting in, so it
+    /// re-issues that call instead of returning from one it never made.
+    public var pc: UInt64
+
+    public init(registers: [UInt64], sp: UInt64, pc: UInt64) {
+        precondition(registers.count == 31, "x0…x30")
+        self.registers = registers
+        self.sp = sp
+        self.pc = pc
+    }
+}
+
 /// Addresses in the target process. The dyld shared cache is mapped at one address for the whole
 /// boot, so an address resolved here is the same address in the target.
 public struct AddressTable: Equatable {
     public var msgSend: UInt64
     public var selRegisterName: UInt64
-    public var nsAppGlobal: UInt64
+    public var objcGetClass: UInt64
 
-    public init(msgSend: UInt64, selRegisterName: UInt64, nsAppGlobal: UInt64) {
+    public init(msgSend: UInt64, selRegisterName: UInt64, objcGetClass: UInt64) {
         self.msgSend = msgSend
         self.selRegisterName = selRegisterName
-        self.nsAppGlobal = nsAppGlobal
+        self.objcGetClass = objcGetClass
+    }
+
+    /// Resolves the three functions from this process. `NSApplication` is asked for by name inside
+    /// the target, because the `_NSApp` global is not a symbol reachable from here.
+    public static func current() -> AddressTable? {
+        let process = dlopen(nil, RTLD_NOW)
+        let appKit = dlopen("/System/Library/Frameworks/AppKit.framework/AppKit", RTLD_NOW)
+        func address(_ name: String) -> UInt64? {
+            guard let symbol = dlsym(appKit ?? process, name) ?? dlsym(process, name) else { return nil }
+            return UInt64(UInt(bitPattern: symbol))
+        }
+        guard let msgSend = address("objc_msgSend"),
+              let selRegisterName = address("sel_registerName"),
+              let objcGetClass = address("objc_getClass") else { return nil }
+        return AddressTable(msgSend: msgSend, selRegisterName: selRegisterName, objcGetClass: objcGetClass)
     }
 }

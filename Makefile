@@ -39,6 +39,7 @@ test:
 	cd app && swift test
 	$(MAKE) testtools probe
 	tests/probe.sh
+	tests/engine.sh
 
 testtools: tests/hostapp tests/winpixels
 
