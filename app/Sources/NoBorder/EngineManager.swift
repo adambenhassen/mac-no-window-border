@@ -16,6 +16,13 @@ final class EngineManager: ObservableObject {
     private var loop: ScanLoop?
     private var log: FileHandle? = LogFile.open()
 
+    /// The only way `status` is set. The loop reports the number of windows it has changed on every
+    /// cycle — four a second — and a report that repeats the last one is not news: telling SwiftUI
+    /// the menu changed makes it redraw the menu bar item, which is what this app's idle CPU is.
+    private lazy var reported = StatusPublisher(.off) { [weak self] next in
+        self?.status = next
+    }
+
     init() {
         enabled = UserDefaults.standard.object(forKey: "enabled") as? Bool ?? true
         // A Dock quit, a Cmd-Q, a "Quit" from anywhere: the windows we changed go back before the
@@ -60,7 +67,7 @@ final class EngineManager: ObservableObject {
         forward.next = newLoop.engineLog()
         loop = newLoop
         newLoop.start()
-        status = .running(windows: 0)
+        reported.set(.running(windows: 0))
     }
 
     /// Stopping is synchronous on purpose: the loop's `stop` is what puts every changed window back,
@@ -68,15 +75,15 @@ final class EngineManager: ObservableObject {
     private func stop() {
         guard let loop = loop else { return }
         self.loop = nil
-        status = .stopping
+        reported.set(.stopping)
         loop.stop()
-        status = .off
+        reported.set(.off)
     }
 
     // MARK: - what the loop says
 
     private func changed(_ windows: Int) {
-        status = .running(windows: windows)
+        reported.set(.running(windows: windows))
     }
 
     private func write(_ line: String) {
