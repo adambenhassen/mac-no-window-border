@@ -20,8 +20,18 @@ final class EngineChoiceTests: XCTestCase {
         suite = nil
     }
 
-    func testTheDefaultIsTheLegacyEngine() {
+    func testTheDefaultIsTheNativeEngine() {
+        XCTAssertEqual(EngineChoice.current(defaults: defaults, args: ["NoBorder"]), .native,
+                       "the default is native: the user ran this engine on their own desktop and it " +
+                           "works, which is the acceptance the phase asked for")
+    }
+
+    func testTheLegacyEngineIsStillSelectable() {
+        defaults.set("legacy", forKey: "engine")
         XCTAssertEqual(EngineChoice.current(defaults: defaults, args: ["NoBorder"]), .legacy)
+        defaults.set("native", forKey: "engine")
+        XCTAssertEqual(EngineChoice.current(defaults: defaults, args: ["NoBorder", "-noborderEngine", "legacy"]), .legacy,
+                       "the LLDB path stays selectable while it is in the app")
     }
 
     func testTheLaunchArgumentSelectsTheNativeEngine() {
@@ -45,20 +55,21 @@ final class EngineChoiceTests: XCTestCase {
         XCTAssertEqual(EngineChoice.current(defaults: defaults, args: ["NoBorder", "-noborderEngine", "native"]), .native)
     }
 
-    func testAnUnrecognisedValueInTheDefaultsIsTheLegacyEngine() {
+    func testAnUnrecognisedValueInTheDefaultsIsTheDefaultEngine() {
         for value in ["Native", "NATIVE", "nativ", "native engine", "", "lldb", "0", "1"] {
             defaults.set(value, forKey: "engine")
-            XCTAssertEqual(EngineChoice.current(defaults: defaults, args: ["NoBorder"]), .legacy,
-                           "'\(value)' is not a spelling of an engine; the safe answer is the one shipping today")
+            XCTAssertEqual(EngineChoice.current(defaults: defaults, args: ["NoBorder"]), .native,
+                           "'\(value)' is not a spelling of an engine, so it is not a choice: the " +
+                               "answer is the engine the app ships with")
         }
     }
 
-    func testAnUnrecognisedLaunchArgumentIsTheLegacyEngine() {
+    func testAnUnrecognisedLaunchArgumentIsTheDefaultEngine() {
         for args in [["-noborderEngine", "Native"], ["-noborderEngine", "xcrun"], ["-noborderEngine"],
-                     ["-noborderEngine", "native", "-noborderEngine", "legacy"]] {
+                     ["-noborderEngine", "legacy", "-noborderEngine", "Native"]] {
             var full = ["NoBorder"]
             full.append(contentsOf: args)
-            XCTAssertEqual(EngineChoice.current(defaults: defaults, args: full), .legacy,
+            XCTAssertEqual(EngineChoice.current(defaults: defaults, args: full), .native,
                            "\(args) says nothing usable")
         }
     }

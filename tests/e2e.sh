@@ -234,12 +234,24 @@ app_mode() {
         || { echo "FAIL app(native) repeats refusals: $refusals lines for $pids processes"; fail=1; }
     stopapp
 
-    # No arguments: the app must still start the Python daemon, as it did in v1.1.
-    runapp legacy
-    if await "^status: running"; then
-        echo "PASS app(legacy) starts the daemon: $(applog | grep "^status: running" | head -1)"
+    # No arguments: the shipped default, which is the native engine now. Asserted by what the app
+    # does to a window, not by a log line about its own configuration.
+    runapp default
+    if await "applying $max\$" 20; then
+        echo "PASS app with no arguments runs the native engine: $(applog | grep "applying $max" | head -1)"
     else
-        echo "FAIL app(legacy) did not start the daemon: $(applog | tail -5)"
+        echo "FAIL app with no arguments did not apply the maximized window: $(applog | tail -5)"
+        fail=1
+    fi
+    stopapp
+
+    # The legacy engine, named on the command line: the app must still start the Python daemon, as it
+    # did in v1.1. This is what "both engines until the number says otherwise" keeps true.
+    runapp legacy -noborderEngine legacy
+    if await "^status: running"; then
+        echo "PASS app(-noborderEngine legacy) starts the daemon: $(applog | grep "^status: running" | head -1)"
+    else
+        echo "FAIL app(-noborderEngine legacy) did not start the daemon: $(applog | tail -5)"
         fail=1
     fi
     stopapp
