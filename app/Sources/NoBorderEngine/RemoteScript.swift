@@ -9,6 +9,9 @@ public struct RemoteScript: Equatable {
     public var hasShadow: Bool?
     public var cornerRadius: Double?
     public var drawsDecoration: Bool?
+    /// Test-only: makes the generated code jump to an address no process has mapped, so the fault
+    /// guard has something to catch. Product code never sets it and nothing sets it by default.
+    public var forceFaultForTesting = false
 
     public init(windowNumbers: [UInt32], hasShadow: Bool?, cornerRadius: Double?, drawsDecoration: Bool?) {
         self.windowNumbers = windowNumbers

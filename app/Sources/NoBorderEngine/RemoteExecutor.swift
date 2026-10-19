@@ -5,12 +5,15 @@ public enum RunResult: Equatable {
     case ok
     case notParked
     case timedOut
+    /// The call script faulted in the target; the fault guard handed the thread back to the app.
+    case faulted
     case failed(String)
 }
 
 /// Runs a `RemoteScript` inside another process: read the parked main thread, write the script and
 /// its data into the target, point the thread at it and end its run-loop wait so it gets there.
-/// The script hands the thread back to the app itself; we only read a flag to see that it did.
+/// The script hands the thread back to the app itself; we only read a flag to see that it did. If
+/// the script faults, `FaultGuard` answers for the thread instead, and the app never sees the fault.
 public final class RemoteExecutor {
     private let task: TargetTask
 
@@ -33,8 +36,9 @@ public final class RemoteExecutor {
 
     deinit { releaseScratch() }
 
-    /// The result, and how long in nanoseconds the target's main thread was running our code
-    /// instead of its own — measured from ending its run-loop wait to reading the completion flag.
+    /// The result, and how long in nanoseconds the target's main thread was out of its own code —
+    /// measured from ending its run-loop wait to the point the thread went back to the app, whether
+    /// that was the script's last call, the fault guard's reply, or us giving up.
     public func run(_ script: RemoteScript, on main: MainThread, addresses: AddressTable,
                    stopLimit: TimeInterval = 0.2) -> (result: RunResult, stopNanoseconds: Int) {
         guard let parked = main.state() else { return (.failed("could not read the thread state"), 0) }
@@ -42,6 +46,11 @@ public final class RemoteExecutor {
 
         let started = DispatchTime.now().uptimeNanoseconds
         let handback = ThreadHandback(from: parked, restartAt: entryOf(parked.__pc))
+        // The state the fault guard puts on the thread if the script faults: the app's own registers
+        // and the start of the run-loop call it was sitting in, exactly where the script would have
+        // handed it back.
+        var backToTheApp = parked
+        backToTheApp.__pc = handback.pc
         let code = Trampoline.code(script, addresses: addresses, handback: handback)
         let data = Trampoline.data(script, addresses: addresses, handback: handback)
         let dataAt = Trampoline.dataOffset(codeWordCount: code.count)
@@ -65,13 +74,24 @@ public final class RemoteExecutor {
         // kernel return it to user space, which is where it picks the new pc up. If the call cannot
         // be ended we put the thread's state back and leave it alone.
         let underOurControl = DispatchTime.now().uptimeNanoseconds
+        let faults = FaultGuard(task: task)
+        guard faults.install() else {
+            _ = main.setState(parked)
+            return (.failed("could not install the fault guard"), elapsedSince(started))
+        }
         guard thread_abort(main.port) == KERN_SUCCESS else {
             _ = main.setState(parked)
+            faults.remove()
             return (.failed("could not end the run loop's wait"), elapsedSince(started))
         }
-        let result = waitForCompletion(at: flagAddress, deadline: underOurControl + UInt64(stopLimit * 1_000_000_000))
-        let stop = result == .ok ? Int(DispatchTime.now().uptimeNanoseconds - underOurControl)
-                                : elapsedSince(started)
+        let result = waitForCompletion(at: flagAddress, deadline: underOurControl + UInt64(stopLimit * 1_000_000_000),
+                                      faults: faults, on: main, restoringTo: backToTheApp)
+        faults.remove()
+        // Once the thread is back with the app — the script's own jump, or our reply to a fault —
+        // the stop is over. Anything else (a timeout, a target that went away) is counted from the
+        // start, because we do not know when, or whether, it came back.
+        let stop = (result == .ok || result == .faulted) ? Int(DispatchTime.now().uptimeNanoseconds - underOurControl)
+                                                        : elapsedSince(started)
         return (result, stop)
     }
 
@@ -93,12 +113,17 @@ public final class RemoteExecutor {
     /// use, so nothing else writes there.
     private var flagAddress: UInt64 { stackTop + UInt64(Trampoline.completionFlagOffset) }
 
-    private func waitForCompletion(at flag: UInt64, deadline: UInt64) -> RunResult {
+    private func waitForCompletion(at flag: UInt64, deadline: UInt64, faults: FaultGuard,
+                                  on main: MainThread, restoringTo state: arm_thread_state64_t) -> RunResult {
         while DispatchTime.now().uptimeNanoseconds < deadline {
             guard let value = task.readWord(at: flag) else {
-                return .failed("could not read the completion flag")   // Task 5: .faulted
+                return .failed("could not read the completion flag")
             }
             if value == 0 { return .ok }
+            // The flag is never written by a script that faults, so a fault is the other way this
+            // wait ends. The flag is read first: if the script finished, a fault that arrived after
+            // it belongs to the app, not to us.
+            if faults.tookFault(on: main, restoringTo: state) { return .faulted }
         }
         return .timedOut
     }

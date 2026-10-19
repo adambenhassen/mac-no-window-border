@@ -196,6 +196,11 @@ public enum Trampoline {
         for name in selectorNames { strings[name] = blob.appendString(name) }
 
         var ops: [Op] = [.adrBlobBase(dst: blobRegister)]
+        if script.forceFaultForTesting {
+            // Before anything is applied: a test that wants a fault wants to see that the app is
+            // unharmed *and* untouched, not just that it survived.
+            ops = [.movImm(dst: 16, value: 1), .branch(to: 16)]   // an address no process has mapped
+        }
         // app = objc_getClass("NSApplication")
         ops.append(.loadFromBlob(dst: classLookupRegister, blobOffset: blob.objcGetClass))
         ops.append(.adrBlob(dst: 0, offset: strings[applicationClass]!))

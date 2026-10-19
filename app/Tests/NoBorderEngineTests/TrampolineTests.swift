@@ -81,6 +81,24 @@ final class TrampolineTests: XCTestCase {
         return 4 * instruction + (immlo | (imm19 << 2))
     }
 
+    func testForceFaultForTestingJumpsToAnAddressNoProcessHas() {
+        var script = RemoteScript.applied(windowNumbers: [7])
+        script.forceFaultForTesting = true
+        let code = self.code(script)
+        guard let at = code.firstIndex(of: Arc64.movz(dst: 16, value: 1)) else {
+            return XCTFail("nothing jumps to address 1")
+        }
+        XCTAssertTrue(at + 1 < code.count)
+        XCTAssertEqual(code[at + 1], Arc64.br(16), "the jump is not the instruction after it")
+        let flag = code.firstIndex(of: Arc64.strZero(base: 31, offset: Trampoline.completionFlagOffset))!
+        XCTAssertLessThan(at, flag, "the fault must happen while the thread is still ours")
+    }
+
+    func testForceFaultIsOffUnlessATestAsksForIt() {
+        XCTAssertFalse(RemoteScript.applied(windowNumbers: [7]).forceFaultForTesting)
+        XCTAssertFalse(self.code(RemoteScript.applied(windowNumbers: [7])).contains(Arc64.movz(dst: 16, value: 1)))
+    }
+
     func testTheDataOffsetStartsAfterTheCodeAndIsEightAligned() {
         // The code reads its data with 8-byte loads from one base register, so the base must be
         // 8-aligned and must not overlap the code.

@@ -56,6 +56,20 @@ extension ThreadHandback {
     }
 }
 
+/// The kernel's system-wide id for a thread, the only number that means the same thing in two
+/// processes: a thread port is a name in one task, so an exception message's thread port has to be
+/// matched by its id, not by the port. nil when the port is not a thread.
+func kernelThreadID(of thread: mach_port_t) -> UInt64? {
+    var info = thread_identifier_info()
+    var count = mach_msg_type_number_t(MemoryLayout<thread_identifier_info>.size / MemoryLayout<integer_t>.size)
+    let kr = withUnsafeMutablePointer(to: &info) { pointer in
+        pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+            thread_info(thread, thread_flavor_t(THREAD_IDENTIFIER_INFO), $0, &count)
+        }
+    }
+    return kr == KERN_SUCCESS ? info.thread_id : nil
+}
+
 extension TargetTask {
     private static let idleTraps: Set<String> = ["mach_msg2_trap", "mach_msg_trap"]
     private static let runLoopPortFrame = "__CFRunLoopServiceMachPort"
@@ -75,24 +89,12 @@ extension TargetTask {
         }
         var found: MainThread?
         for index in 0..<Int(count) {
-            guard let identity = identity(of: list[index]) else { continue }
-            if found == nil || identity.id < found!.id {
-                found = MainThread(port: list[index], id: identity.id)
+            guard let id = kernelThreadID(of: list[index]) else { continue }
+            if found == nil || id < found!.id {
+                found = MainThread(port: list[index], id: id)
             }
         }
         return found
-    }
-
-    private func identity(of thread: thread_act_t) -> (id: UInt64, handle: UInt64)? {
-        var info = thread_identifier_info()
-        var count = mach_msg_type_number_t(MemoryLayout<thread_identifier_info>.size / MemoryLayout<integer_t>.size)
-        let kr = withUnsafeMutablePointer(to: &info) { pointer in
-            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
-                thread_info(thread, thread_flavor_t(THREAD_IDENTIFIER_INFO), $0, &count)
-            }
-        }
-        guard kr == KERN_SUCCESS else { return nil }
-        return (info.thread_id, info.thread_handle)
     }
 
     public func parkState(of main: MainThread) -> ParkState {

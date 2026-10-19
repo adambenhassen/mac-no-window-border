@@ -1,7 +1,7 @@
 import Foundation
 import NoBorderEngine
 
-let usage = "usage: noborder-probe taskport|mainthread|park|threadinfo <pid> | run <pid> <wid> applied|restored"
+let usage = "usage: noborder-probe taskport|mainthread|park|threadinfo <pid> | run <pid> <wid> applied|restored [fault]"
 let args = CommandLine.arguments
 guard args.count >= 3, let pid = Int32(args[2]) else {
     print(usage)
@@ -25,6 +25,7 @@ func describe(_ result: RunResult) -> String {
     case .ok: return "ok"
     case .notParked: return "not-parked"
     case .timedOut: return "timed-out"
+    case .faulted: return "faulted"
     case .failed: return "failed"
     }
 }
@@ -68,13 +69,15 @@ case "threadinfo":
     guard kr == KERN_SUCCESS, let state = main.state() else { fail("threadinfo \(pid) kr=\(kr)") }
     print("threadinfo \(pid) run_state=\(info.run_state) flags=\(info.flags) pc=\(describe(address: state.__pc))")
 case "run":
-    guard args.count == 5, let wid = UInt32(args[3]) else { print(usage); exit(2) }
-    let script: RemoteScript
+    guard args.count >= 5, args.count <= 6, let wid = UInt32(args[3]) else { print(usage); exit(2) }
+    if args.count == 6, args[5] != "fault" { print(usage); exit(2) }
+    var script: RemoteScript
     switch args[4] {
     case "applied": script = RemoteScript.applied(windowNumbers: [wid])
     case "restored": script = RemoteScript.restored(windowNumbers: [wid])
     default: print(usage); exit(2)
     }
+    script.forceFaultForTesting = args.count == 6
     guard let addresses = AddressTable.current() else { fail("run \(pid) no-addresses") }
     guard let main = task.mainThread() else { fail("run \(pid) no-main-thread") }
     let (result, stopNanoseconds) = RemoteExecutor(task: task).run(script, on: main, addresses: addresses)

@@ -49,6 +49,25 @@ case "$out" in
 esac
 stop_host
 
+# Review Focus: a call that faults must leave the app alive, parkable, and untouched.
+start_host ""
+out=$($probe run $host $maxwid applied fault)
+case "$out" in
+    result=faulted*) note "PASS engine catches a fault: $out" ;;
+    *) note "FAIL engine catches a fault: $out" ;;
+esac
+us=$(print -r -- "$out" | sed -n 's/.*stop_us=\([0-9]*\).*/\1/p')
+[[ -n "$us" && "$us" -lt 5000 ]] && note "PASS fault handled without a long stop: ${us}us" \
+                                 || note "FAIL fault stop too long or missing: '$out'"
+sleep 2
+kill -0 $host 2>/dev/null && note "PASS app survives a faulting call" || note "FAIL app died from a faulting call"
+[[ "$($probe park $host)" == "park $host parked" ]] && note "PASS app parks again after a fault" \
+                                                    || note "FAIL app does not park again after a fault"
+px=$(squared $maxwid)
+[[ "$px" == square=0* ]] && note "PASS faulting call left the window alone: $px" \
+                         || note "FAIL faulting call changed the window: $px"
+stop_host
+
 # Review Focus: an app whose main thread never parks must not be touched at all.
 start_host spin
 for _ (1 2 3 4 5 6 7 8 9 10); do      # the app starts spinning 0.5 s after its first draw
