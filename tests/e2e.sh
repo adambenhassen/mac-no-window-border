@@ -34,6 +34,27 @@ tagcount() {  # tagcount <log> <wid>: number of "tagging" log lines that name <w
     awk -v w=$2 '$3=="tagging" { for (i = 4; i <= NF; i++) if ($i == w) { n++; break } } END { print n + 0 }' $1
 }
 
+decisions() {  # decisions <log> <wid>: the daemon's own change lines naming <wid>, as verbs. A line
+               # is "<date> <time> squaring pid 1234: 567 568" (restoring the same shape), so the
+               # window numbers start at field 6.
+    awk -v w=$2 '($3 == "squaring" || $3 == "restoring") {
+        for (i = 6; i <= NF; i++) if ($i == w) { print $3; next }
+    }' $1
+}
+
+ncount() {  # ncount <verb> <wid> <log>: how many times the daemon changed <wid> that way
+    decisions $3 $2 | grep -c "^$1$"
+}
+
+checkcount() {  # checkcount <label> <want> <got>
+    if [[ "$3" == "$2" ]]; then
+        echo "PASS $1: $3"
+    else
+        echo "FAIL $1: got '$3', want '$2'"
+        fail=1
+    fi
+}
+
 strip() {  # strip <png>: capture a 40 px strip across the maximized window's left edge
     typeset x y w h
     read _ x y w h < <(tests/wbounds $max)
@@ -165,8 +186,19 @@ else
 fi
 check "floating untouched" $float "[shadow] [nomax]" "square=0 rim=1"
 
+# The geometry decision, read from the daemon's own log and not from winscan's [max] column: that
+# column is the same rule in the C scanner, so asserting it here would only show that two copies of
+# the rule agree with each other. These lines are the decision the scan loop makes in the app: the
+# window filling a screen's usable area is chosen, the 600x400 one is never mentioned.
+checkcount "geometry: the maximized window was applied once" 1 "$(ncount squaring $max $out/daemon.log)"
+checkcount "geometry: the floating window was never changed" 0 "$(ncount squaring $float $out/daemon.log)"
+checkcount "geometry: the floating window was never restored" 0 "$(ncount restoring $float $out/daemon.log)"
+
 kill -USR1 $host
 check "un-maximized restored" $max "[shadow] [nomax]" "square=0 rim=1"
+# The window is 600x400 now: the daemon stopped seeing it fill the usable area and restored it. A
+# second restore for it would mean the decision is being re-made every scan.
+checkcount "geometry: un-maximizing restored it once" 1 "$(ncount restoring $max $out/daemon.log)"
 kill -USR2 $host
 check "re-maximized applied (warm, within 5 s)" $max "[noshadow] [max]" "square=1 rim=0" 5
 

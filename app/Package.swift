@@ -7,9 +7,11 @@ let package = Package(
     targets: [
         .target(name: "NoBorderCore"),
         .target(name: "NoBorderEngine"),
+        .target(name: "NoBorderLogic"),
         .executableTarget(name: "noborder-probe", dependencies: ["NoBorderEngine"]),
         .executableTarget(name: "NoBorder", dependencies: ["NoBorderCore", "NoBorderEngine"]),
         .testTarget(name: "NoBorderCoreTests", dependencies: ["NoBorderCore"]),
         .testTarget(name: "NoBorderEngineTests", dependencies: ["NoBorderEngine"]),
+        .testTarget(name: "NoBorderLogicTests", dependencies: ["NoBorderLogic"]),
     ]
 )
