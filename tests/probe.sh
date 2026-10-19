@@ -1,30 +1,73 @@
 #!/bin/zsh
-# Check that build/noborder-probe exists, carries the debugger entitlement, and can get the
-# task port of a live test app. Run by `make test`.
+# Checks the signed probe binary: it must carry the debugger entitlement, get task ports, find the
+# test app's own main thread, and read that thread's parked/running state. These are the Mach
+# operations the native engine is built on; they cannot run inside `swift test`, because SwiftPM's
+# test bundle cannot carry the entitlement.
 set -u
 cd "${0:A:h}/.."
 fail=0
+probe=build/noborder-probe
 
-if [[ ! -x build/noborder-probe ]]; then
-    echo "FAIL probe missing: build/noborder-probe (make probe)"
+note() { print -r -- "$1"; if [[ "$1" == FAIL* ]]; then fail=1; fi; }
+
+if [[ ! -x $probe ]]; then
+    note "FAIL probe missing: $probe (make probe)"
     exit 1
 fi
-
-if ! codesign -d --entitlements - build/noborder-probe 2>&1 | grep -q "com.apple.security.cs.debugger"; then
-    echo "FAIL probe entitlement: com.apple.security.cs.debugger not in the signature"
-    fail=1
+if ! codesign -d --entitlements - $probe 2>&1 | grep -q "com.apple.security.cs.debugger"; then
+    note "FAIL probe entitlement: com.apple.security.cs.debugger not in the signature"
 fi
 
-./tests/hostapp > /dev/null &
-host=$!
-sleep 1
-out=$(build/noborder-probe taskport $host)
-kill $host
-if [[ "$out" == "taskport $host ok" ]]; then
-    echo "PASS probe taskport: $out"
+start_host() {  # start_host [args...] -> sets host, host_mainthread
+    ./tests/hostapp $=1 > build/hostapp.out &
+    host=$!
+    for _ (1 2 3 4 5 6 7 8 9 10); do
+        host_mainthread=$(awk '$1=="mainthreadid" {print $2}' build/hostapp.out)
+        [[ -n $host_mainthread ]] && break
+        sleep 0.3
+    done
+    [[ -n $host_mainthread ]] || note "FAIL hostapp printed no main thread id"
+}
+
+stop_host() { [[ -n $host ]] && kill $host 2>/dev/null; wait $host 2>/dev/null; host="" }
+
+start_host ""
+out=$($probe taskport $host)
+[[ "$out" == "taskport $host ok" ]] && note "PASS probe taskport: $out" || note "FAIL probe taskport: '$out'"
+
+out=$($probe mainthread $host)
+if [[ "$out" == "mainthread $host $host_mainthread" ]]; then
+    note "PASS probe mainthread is the app's own thread ($host_mainthread)"
 else
-    echo "FAIL probe taskport: got '$out'"
-    fail=1
+    note "FAIL probe mainthread: got '$out', want 'mainthread $host $host_mainthread'"
 fi
+
+parked=0
+for _ (1 2 3 4 5); do
+    [[ "$($probe park $host)" == "park $host parked" ]] && parked=$((parked + 1))
+    sleep 0.2
+done
+(( parked >= 1 )) && note "PASS probe park: idle app reads parked ($parked/5)" \
+                  || note "FAIL probe park: idle app never read parked"
+stop_host
+
+start_host busy
+notparked=0
+for _ (1 2 3 4 5 6 7 8 9 10); do
+    [[ "$($probe park $host)" != "park $host parked" ]] && notparked=$((notparked + 1))
+    sleep 0.1
+done
+(( notparked >= 5 )) && note "PASS probe park: busy app reads not-parked ($notparked/10)" \
+                     || note "FAIL probe park: busy app read parked too often ($notparked/10)"
+
+kill -HUP $host
+became=0
+for _ (1 2 3 4 5 6 7 8 9 10); do
+    [[ "$($probe park $host)" == "park $host parked" ]] && became=1 && break
+    sleep 0.2
+done
+(( became )) && note "PASS probe park: app reads parked once it goes idle" \
+             || note "FAIL probe park: app never read parked after going idle"
+stop_host
 
 exit $fail

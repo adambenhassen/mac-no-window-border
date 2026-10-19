@@ -25,6 +25,11 @@ func makeWindow(_ name: String, _ frame: NSRect) -> NSWindow {
 let small = NSRect(x: usable.minX + 200, y: usable.minY + 150, width: 600, height: 400)
 let maxWindow = makeWindow("max", CommandLine.arguments.contains("small") ? small : usable)
 let floating = makeWindow("floating", NSRect(x: usable.minX + 100, y: usable.minY + 100, width: 400, height: 300))
+var idInfo = thread_identifier_info()
+var idCount = mach_msg_type_number_t(MemoryLayout<thread_identifier_info>.size / MemoryLayout<integer_t>.size)
+withUnsafeMutablePointer(to: &idInfo) { p in p.withMemoryRebound(to: integer_t.self, capacity: Int(idCount)) {
+    thread_info(pthread_mach_thread_np(pthread_self()), thread_flavor_t(THREAD_IDENTIFIER_INFO), $0, &idCount) } }
+print("mainthreadid", idInfo.thread_id)
 fflush(stdout)
 
 var sources: [DispatchSourceSignal] = []
