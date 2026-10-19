@@ -61,7 +61,11 @@ tests/wbounds: tests/wbounds.m
 tests/plainrunloop: tests/plainrunloop.swift
 	swiftc -O -o $@ $<
 
+# The pause benchmark: the app's own measure of how long each engine stops its main loop.
+bench: testtools probe
+	tests/pausebench.sh all
+
 clean:
 	rm -rf winscan build app/.build tests/hostapp tests/winpixels tests/pxband tests/wbounds tests/plainrunloop
 
-.PHONY: all app probe release install test testtools clean
+.PHONY: all app probe release install test testtools bench clean

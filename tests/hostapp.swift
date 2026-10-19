@@ -6,6 +6,9 @@
 // With the "spin" argument (tests/engine.sh), the main thread never comes back to its run loop at
 // all: there is no moment when it is parked. SIGTERM stops it.
 // With the "small" argument, "max" starts at the 600x400 size, so it is never maximized.
+// With the "tick" argument (tests/pausebench.sh), a 1 ms main-queue timer reports every 5 s the
+// longest gap between its fires: that gap is how long the main thread was not running its own
+// queue, which is what an engine's stop costs an app.
 import AppKit
 
 let app = NSApplication.shared
@@ -35,6 +38,7 @@ print("mainthreadid", idInfo.thread_id)
 fflush(stdout)
 
 var sources: [DispatchSourceSignal] = []
+var tickTimer: DispatchSourceTimer?   // kept here: a source that goes out of scope is released and stops firing
 var spinCount = 0   // written by the "spin" mode below, so the loop around it cannot be optimized out
 for (sig, frame) in [(SIGUSR1, small), (SIGUSR2, usable)] {
     signal(sig, SIG_IGN)
@@ -60,5 +64,29 @@ if CommandLine.arguments.contains("spin") {
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {   // after the first draw
         while true { spinCount &+= 1 }    // a hard spin; the counter keeps the optimiser away
     }
+}
+if CommandLine.arguments.contains("tick") {
+    // Zero leeway: the timer is asked for every 1 ms and the gap between two fires is measured, so
+    // nothing but the main thread being busy (or stopped) can widen it. The 1 ms period is
+    // subtracted, so an app that is left alone reports 0.
+    // The source is kept in a top-level array: a dispatch source that goes out of scope is released,
+    // and a released source stops firing.
+    let timer = DispatchSource.makeTimerSource(queue: .main)
+    timer.schedule(deadline: .now() + 0.001, repeating: 0.001, leeway: .never)
+    var last = DispatchTime.now().uptimeNanoseconds
+    var worst: UInt64 = 0
+    var windowEnd = DispatchTime.now().uptimeNanoseconds + 5_000_000_000
+    timer.setEventHandler {
+        let now = DispatchTime.now().uptimeNanoseconds
+        worst = max(worst, now - last)
+        last = now
+        guard now >= windowEnd else { return }
+        print("maxgap_ms=\(max(0, Int(worst) - 1_000_000) / 1_000_000)")
+        fflush(stdout)
+        worst = 0
+        windowEnd = now + 5_000_000_000
+    }
+    timer.resume()
+    tickTimer = timer
 }
 app.run()
