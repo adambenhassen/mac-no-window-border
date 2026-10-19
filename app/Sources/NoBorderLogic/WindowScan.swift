@@ -20,10 +20,10 @@ public struct NormalWindow: Equatable {
 
 /// Which windows are on screen, and which of them fill their screen's usable area.
 ///
-/// This is the Swift port of `winscan.m`'s window list and maximized test, without the shadow tag:
-/// the native path never reads the WindowServer tag (a window we changed keeps reporting a shadow),
-/// so reading it here would only cost a call per window. Layer 0 is what AppKit puts ordinary app
-/// windows in; every panel, menu, and wallpaper window has another layer and is not ours to change.
+/// The window list and the maximized test, with no shadow tag: the WindowServer tag is never read
+/// (a window we changed keeps reporting a shadow), so reading it would only cost a call per window.
+/// Layer 0 is what AppKit puts ordinary app windows in; every panel, menu, and wallpaper window has
+/// another layer and is not ours to change.
 ///
 /// The scan does not decide maximized: the caller pairs these frames with `visibleFramesAsCG()` and
 /// `isMaximized` when it turns them into `ScannedWindow`s, so the decision is one the tests can make
@@ -58,7 +58,7 @@ public enum WindowScan {
         // application. In a process that has none — a command-line tool, a test bundle — every display
         // except the primary reports its whole frame, and a window maximized on it is then 25 pt short
         // of the area measured, i.e. never maximized. Asking for the shared application is the port of
-        // winscan.m's [NSApplication sharedApplication]; it is a no-op in the app, which has one, and
+        // [NSApplication sharedApplication]; it is a no-op in the app, which has one, and
         // the app's own activation policy is left untouched.
         _ = NSApplication.shared
         let screens = NSScreen.screens

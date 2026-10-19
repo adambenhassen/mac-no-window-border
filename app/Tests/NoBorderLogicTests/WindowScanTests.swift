@@ -132,7 +132,7 @@ final class WindowScanTests: XCTestCase {
     /// display, `NSScreen.visibleFrame` for it comes back as the whole screen frame — no menu-bar
     /// inset — so every window maximized on that display is 25 pt short of the area the scanner
     /// measured and never reads as maximized. The shipped scanner sets up an NSApplication for this
-    /// same reason (see the comment in winscan.m).
+    /// same reason (see the comment in `WindowScan`).
     ///
     /// The call is taken before this test touches `NSApplication.shared`, so it measures what a
     /// caller gets in a cold process. Where no attached display has a menu-bar inset there is nothing

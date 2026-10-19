@@ -22,7 +22,7 @@ func makeWindow(_ name: String, _ frame: NSRect) -> NSWindow {
     w.appearance = NSAppearance(named: .darkAqua)
     w.backgroundColor = NSColor(white: 0.05, alpha: 1)
     w.setFrame(frame, display: false)
-    w.orderBack(nil)  // stay behind the user's windows; still on screen for winscan
+    w.orderBack(nil)  // stay behind the user's windows; still on screen for the scanner
     print(name, w.windowNumber)
     return w
 }

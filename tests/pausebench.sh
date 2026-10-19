@@ -1,6 +1,6 @@
 #!/bin/zsh
-# How long each engine stops the app's own main loop. This is the number the phase is judged by:
-# the native engine has to stay under 5 ms, where the LLDB path costs seconds.
+# How long the engine stops the app's own main loop. This is the number the phase is judged by:
+# the engine has to stay under 5 ms.
 #
 # The measurement is the app's own: tests/hostapp tick runs a 1 ms main-queue timer with no leeway
 # and reports, every 5 s, the longest gap between two of its fires. A gap is a stretch in which the
@@ -8,22 +8,20 @@
 #
 # What is *not* the engine has to be measured too, because it is not small: an app crossing the
 # maximized boundary spends several milliseconds of its own main thread resizing, and a test that
-# photographs the window every half second keeps the app's window-server connection busy. So each
-# engine is run twice over the same driving — with the engine, and with nothing (the baseline) — and
-# the native engine's own action is measured on its own as well: apply and restore on a window that
-# is already in the state the engine is asked for, which is what a scan loop does.
+# photographs the window every half second keeps the app's window-server connection busy. So the
+# driving is run twice, with the engine and with nothing (the baseline), and the engine's own action
+# is measured on its own as well: apply and restore on a window that is
+# already in the state the engine is asked for, which is what a scan loop does.
 set -u
 typeset -F SECONDS  # fractional, so the poll deadlines are exact
 cd "${0:A:h}/.."
 mkdir -p build/bench
-# No arguments, or "isolated": the native engine's own action only. It is the number the verdict is
-# made on, so it is worth measuring on its own, more than once, before it is believed.
-# "all": both engines plus the isolated run — the full benchmark, which is what `make bench` runs.
-engines=("$@")
-if (( ${#engines[@]} == 0 )) || [[ ${engines[1]} == all ]]; then
-    engines=(legacy native)
-elif [[ ${engines[1]} == isolated ]]; then
-    engines=()
+# No arguments: the full benchmark — the driving with the engine and without it, plus the isolated
+# run. That is what `make bench` runs. "isolated": the engine's own action only, which is the number
+# the verdict is made on, so it is worth measuring on its own, more than once, before it is believed.
+modes=()
+if [[ ${1:-} != isolated ]]; then
+    modes=(native)
 fi
 say() { print -r -- "$1"; }
 # What the last measurement produced, for the caller to report.
@@ -75,38 +73,27 @@ max_gap() {  # max_gap <label> -> the largest reported gap, skipping the launch 
 
 # The same driving for every caller: one window across the maximized boundary twice. The app does
 # exactly the same thing with and without an engine, which is what makes the two comparable.
-drive() {  # drive <label> <legacy|native|none> -> sets $gap and $applied
-    local engine=$2 i limit=5
+drive() {  # drive <label> <native|none> -> sets $gap and $applied
+    local engine=$2 i
     applied=0
     local steps=(apply restore apply restore)
     local signals=(USR2 USR1 USR2 USR1)   # maximize / un-maximize
-    [[ $engine == legacy ]] && limit=30   # an LLDB attach takes seconds; the poll must outlast it
     start_app $1 || { say "FAIL bench: hostapp printed no window number"; return 1; }
-    local daemon=""
-    [[ $engine == legacy ]] && { NOBORDER_GRACE_S=0 ./noborder.py --pids $host > build/bench/daemon-$1.log 2>&1 & daemon=$!; }
     for i in 1 2 3 4; do
         kill -SIG${signals[$i]} $host 2>/dev/null
         sleep 0.5   # let the app finish resizing before the engine is asked to follow
-        if [[ $engine == native && ${steps[$i]} == apply ]]; then
-            build/noborder-probe apply $host $max > build/bench/probe.log 2>&1
-        elif [[ $engine == native ]]; then
-            build/noborder-probe restore $host $max > build/bench/probe.log 2>&1
+        if [[ $engine == none ]]; then
+            sleep 1.5
+            continue   # nothing will change; measure the driving alone
         fi
+        build/noborder-probe ${steps[$i]} $host $max > build/bench/probe.log 2>&1
         local want="square=1 rim=0"
         [[ ${steps[$i]} == restore ]] && want="square=0 rim=1"
-        [[ $engine == none ]] && { sleep 1.5; continue; }   # nothing will change; measure the driving alone
-        reached $max "$want" $limit && applied=$((applied + 1))
+        reached $max "$want" 5 && applied=$((applied + 1))
     done
-    # The legacy engine's SIGTERM restore is part of what it costs the app, so read the gaps after it.
-    if [[ -n $daemon ]]; then
-        kill -TERM $daemon 2>/dev/null
-        for _ in {1..60}; do kill -0 $daemon 2>/dev/null || break; sleep 0.5; done
-        kill -9 $daemon 2>/dev/null; wait $daemon 2>/dev/null
-    fi
     sleep 5.5   # the 5 s window that covers the last action has to be reported before it is read
     gap=$(max_gap $1)
     stop_app
-    applied=$applied
 }
 
 # The native engine's own action, alone: no resize, no captures, no window-server traffic. A scan
@@ -126,11 +113,11 @@ isolated_native() {  # isolated_native <label> -> sets $gap and $applied
     applied=$done
 }
 
-for engine in $engines; do
-    drive "baseline-$engine" none
+for mode in $modes; do
+    drive "baseline-$mode" none
     local_gap=$gap; local_applied=$applied
-    drive "$engine" $engine
-    say "bench engine=$engine maxgap_ms=$gap baseline_ms=$local_gap applied=$applied/4"
+    drive "$mode" $mode
+    say "bench engine=$mode maxgap_ms=$gap baseline_ms=$local_gap applied=$applied/4"
 done
 
 isolated_native "native-isolated"

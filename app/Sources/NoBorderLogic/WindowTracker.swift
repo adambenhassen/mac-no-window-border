@@ -31,10 +31,10 @@ public struct TrackerDecision: Equatable {
 
 /// Which windows are ours to change, and when to change them.
 ///
-/// The port of `windowstate.py`'s `Tracker` without the three things the native path has no use for:
-/// the no-shadow tag and its untag (the changes are made inside the app, and are not a WindowServer
-/// tag), the 2 s → 2 min backoff for a tag a window keeps putting back, and the launch grace for
-/// young processes. What is kept is the part that is about user-visible behaviour:
+/// The window decisions, with the three things this path has no use for left out: the no-shadow tag
+/// and its untag (the changes are made inside the app, and are not a WindowServer tag), a backoff for
+/// a tag a window keeps putting back, and a launch grace for young processes. What is kept is the part
+/// that is about user-visible behaviour:
 ///
 /// - a window has to fill the usable area for `applySettle` before it is changed, and stop filling it
 ///   for `restoreSettle` before it is put back, so a drag is never fought over;

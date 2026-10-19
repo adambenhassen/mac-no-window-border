@@ -1,22 +1,18 @@
 APP = build/NoBorder.app
 
-all: winscan app
-
-winscan: winscan.m
-	clang -O2 -Wall -fobjc-arc -o $@ $< -framework AppKit -framework CoreGraphics \
-		-F/System/Library/PrivateFrameworks -framework SkyLight
+all: app
 
 build/AppIcon.icns: app/make-icon.swift
 	mkdir -p build
 	swift app/make-icon.swift $@
 
-app: winscan build/AppIcon.icns
+app: build/AppIcon.icns
 	cd app && swift build -c release
 	rm -rf $(APP)
 	mkdir -p $(APP)/Contents/MacOS $(APP)/Contents/Resources
 	cp app/Info.plist $(APP)/Contents/Info.plist
 	cp app/.build/release/NoBorder $(APP)/Contents/MacOS/NoBorder
-	cp noborder.py windowstate.py winscan build/AppIcon.icns $(APP)/Contents/Resources/
+	cp build/AppIcon.icns $(APP)/Contents/Resources/
 	codesign --force --sign - --entitlements app/Entitlements.plist $(APP)
 
 # Development binary for driving the native engine by hand (tests/probe.sh drives it).
@@ -35,7 +31,6 @@ install: app
 	cp -R $(APP) /Applications/
 
 test:
-	python3 -m unittest discover -s tests -v
 	cd app && swift test
 	$(MAKE) testtools probe
 	tests/probe.sh
@@ -63,9 +58,9 @@ tests/plainrunloop: tests/plainrunloop.swift
 
 # The pause benchmark: the app's own measure of how long each engine stops its main loop.
 bench: testtools probe
-	tests/pausebench.sh all
+	tests/pausebench.sh
 
 clean:
-	rm -rf winscan build app/.build tests/hostapp tests/winpixels tests/pxband tests/wbounds tests/plainrunloop
+	rm -rf build app/.build tests/hostapp tests/winpixels tests/pxband tests/wbounds tests/plainrunloop
 
 .PHONY: all app probe release install test testtools bench clean

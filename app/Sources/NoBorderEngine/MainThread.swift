@@ -2,7 +2,7 @@ import Darwin
 import Foundation
 
 /// Whether a thread is waiting inside its run loop. Only then does it hold no application lock,
-/// which is what makes running our calls in it safe (same rule Phase 1 used over LLDB).
+/// which is what makes running our calls in it safe.
 public enum ParkState: Equatable {
     case parked
     case running

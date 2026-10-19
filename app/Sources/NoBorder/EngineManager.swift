@@ -1,44 +1,29 @@
 import AppKit
-import Combine
 import Foundation
-import NoBorderCore
 import NoBorderEngine
 import NoBorderLogic
 
-/// Which engine this run of the app uses, and the one object the menu talks to.
+/// The app's engine: the scan loop, running in this process. This is the one object the menu talks
+/// to, and the only place that decides when the loop runs.
 ///
-/// `legacy` runs the bundled `noborder.py` through `DaemonController`, unchanged: a child process,
-/// LLDB, the `status:` pipe. `native` runs the scan loop in this process with `NativeEngine`. The
-/// choice is made once, at startup, by `EngineChoice`, and both paths are kept because the phase's
-/// rule is that the native engine does not become the default until it is measured stopping an app's
-/// main loop by less than 5 ms.
-///
-/// What the user sees is the same either way: the status line, the On/Off, the Quit, and the same
-/// log file. Everything below the choice is the engine's own code; this type only picks, forwards,
-/// and stops.
+/// The window changes themselves are made inside the apps that own them: see `ScanLoop` and
+/// `NativeEngine`.
 @MainActor
 final class EngineManager: ObservableObject {
-    @Published private(set) var status: DaemonStatus = .off
+    @Published private(set) var status: EngineStatus = .off
     @Published private(set) var enabled: Bool
 
-    let choice: EngineChoice
-
-    private var legacy: DaemonController?
-    private var native: ScanLoop?
-    private var observed: AnyCancellable?
+    private var loop: ScanLoop?
     private var log: FileHandle? = LogFile.open()
 
     init() {
-        choice = EngineChoice.current()
         enabled = UserDefaults.standard.object(forKey: "enabled") as? Bool ?? true
-        if choice == .native {
-            // A Dock quit, a Cmd-Q, a "Quit" from anywhere: the windows we changed go back before the
-            // process goes, which is the whole reason the app is the one making the changes.
-            NotificationCenter.default.addObserver(
-                forName: NSApplication.willTerminateNotification, object: nil, queue: .main
-            ) { [weak self] _ in
-                MainActor.assumeIsolated { self?.stopNative() }
-            }
+        // A Dock quit, a Cmd-Q, a "Quit" from anywhere: the windows we changed go back before the
+        // process goes, which is the whole reason the app is the one making the changes.
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.stop() }
         }
         if enabled { start() }
     }
@@ -51,75 +36,38 @@ final class EngineManager: ObservableObject {
 
     /// Quit: put the user's windows back first, then leave.
     func quit() {
-        switch choice {
-        case .legacy:
-            // The controller stops the daemon, waits for it to restore, and terminates the app.
-            legacyController().quit()
-        case .native:
-            stopNative()
-            NSApplication.shared.terminate(nil)
-        }
+        stop()
+        NSApplication.shared.terminate(nil)
     }
 
-    // MARK: - starting and stopping
+    // MARK: - the loop
 
     private func start() {
-        switch choice {
-        case .legacy:
-            legacyController().setEnabled(enabled)
-        case .native:
-            startNative()
-        }
-    }
-
-    private func stop() {
-        switch choice {
-        case .legacy:
-            legacyController().setEnabled(false)
-        case .native:
-            stopNative()
-        }
-    }
-
-    private func legacyController() -> DaemonController {
-        if let existing = legacy { return existing }
-        let controller = DaemonController()
-        legacy = controller
-        // The daemon's status, in the menu, in the same words as before: this app has always shown
-        // what the child process said about itself.
-        observed = controller.$status.sink { [weak self] status in
-            MainActor.assumeIsolated { self?.status = status }
-        }
-        return controller
-    }
-
-    private func startNative() {
-        guard native == nil else { return }
+        guard loop == nil else { return }
         // The engine is built with a forwarder because the loop's log is the place its lines are
-        // filtered: an engine is constructed before the loop that owns it, and both end up talking to
-        // the same sink.
+        // filtered, and an engine is constructed before the loop that owns it.
         let forward = EngineLogForward()
         let engine = NativeEngine(log: forward.say)
-        let loop = ScanLoop(scan: { WindowScan.scan() },
-                            tracker: WindowTracker(),
-                            engine: engine,
-                            log: { [weak self] line in
-                                DispatchQueue.main.async { MainActor.assumeIsolated { self?.write(line) } }
-                            },
-                            status: { [weak self] changed in
-                                DispatchQueue.main.async { MainActor.assumeIsolated { self?.changed(changed) } }
-                            })
-        forward.next = loop.engineLog()
-        native = loop
-        loop.start()
+        let newLoop = ScanLoop(scan: { WindowScan.scan() },
+                               tracker: WindowTracker(),
+                               engine: engine,
+                               log: { [weak self] line in
+                                   DispatchQueue.main.async { MainActor.assumeIsolated { self?.write(line) } }
+                               },
+                               status: { [weak self] changed in
+                                   DispatchQueue.main.async { MainActor.assumeIsolated { self?.changed(changed) } }
+                               })
+        forward.next = newLoop.engineLog()
+        loop = newLoop
+        newLoop.start()
         status = .running(windows: 0)
     }
 
     /// Stopping is synchronous on purpose: the loop's `stop` is what puts every changed window back,
     /// and the app must not be gone before that has been asked for.
-    private func stopNative() {
-        guard let loop = native else { return }
-        native = nil
+    private func stop() {
+        guard let loop = loop else { return }
+        self.loop = nil
         status = .stopping
         loop.stop()
         status = .off

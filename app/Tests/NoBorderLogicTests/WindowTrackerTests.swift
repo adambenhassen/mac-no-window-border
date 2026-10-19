@@ -2,12 +2,10 @@ import Darwin
 import XCTest
 @testable import NoBorderLogic
 
-/// Which windows the tracker changes, ported case by case from `tests/test_windowstate.py`:
-/// every case that is not about the shadow tag, the tag/untag backoff, or the launch grace — those
-/// three are the legacy path's, and the native path has no tag.
+/// Which windows the tracker changes: the cases about those decisions, and none about the shadow tag,
+/// its backoff, or a launch grace — this path has no tag.
 ///
-/// The settle is 0.5 s both ways here (the legacy tracker waits 2 s to apply, because an LLDB
-/// round trip is seconds and a real user drag is shorter). Every case drives `update` at explicit
+/// The settle is 0.5 s both ways here. Every case drives `update` at explicit
 /// times, so a settle is shown to be waited for, not assumed.
 final class WindowTrackerTests: XCTestCase {
     private let pid: pid_t = 500

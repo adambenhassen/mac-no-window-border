@@ -68,7 +68,7 @@ open /Applications/NoBorder.app
 
 ## Usage
 
-The menu bar icon shows the status, the engine this run is using, and has **Enabled**,
+The menu bar icon shows the status, and has **Enabled**,
 **Launch at Login** and **Quit**. The status line says how many windows NoBorder has changed.
 Turning it off, quitting, or the app being terminated restores the windows NoBorder changed; while
 it restores, the menu shows "Stopping: restoring windows…". A window whose app is busy at that
@@ -83,27 +83,6 @@ Logs: `~/Library/Logs/macos-no-window-border.log`.
 through Dock; 2.0 removes it inside each app and makes no tag calls, so it cannot undo a tag v1.1
 left behind. If v1.1 quit cleanly there is nothing to do. If it died, was killed, or the machine
 rebooted, those tags stay in WindowServer until you reopen the affected apps' windows once.
-
-</details>
-
-<details>
-<summary>Choosing the other engine</summary>
-
-2.0 contains both engines: the native one (the default) and the v1.1 LLDB path. To run the old one,
-for one launch:
-
-```sh
-open /Applications/NoBorder.app --args -noborderEngine legacy
-```
-
-or for every launch:
-
-```sh
-defaults write local.macos-no-window-border.app engine legacy   # engine native puts it back
-```
-
-The menu says which engine a run is using. This switch is how the two are compared against the
-benchmark in `tests/pausebench.sh`; it is a development switch, not a feature.
 
 </details>
 
@@ -152,9 +131,6 @@ window**, in that app's own main thread.
   restored, the app never sees the fault, and the log says `engine failed`.
 - **Signing:** the app is signed with `com.apple.security.cs.debugger`, which is what lets it use
   `task_for_pid`. That, plus SIP being off, is the whole privilege it needs.
-- **The v1.1 engine is still in the app** (see [Choosing the other engine](#choosing-the-other-engine)):
-  a Python daemon that drives LLDB, tags windows through Dock, and queues the AppKit calls on the
-  app's run loop. It is kept while the two are measured against each other.
 
 ### Costs and limits
 
@@ -182,20 +158,17 @@ window**, in that app's own main thread.
 ## Development
 
 ```sh
-make test                           # Swift and Python unit tests, the probe checks, the engine checks
-make testtools && tests/e2e.sh      # end-to-end, the v1.1 daemon path (stop NoBorder first)
-make testtools && NOBORDER_ENGINE=native tests/e2e.sh   # end-to-end, the native engine
-make testtools && NOBORDER_E2E=app tests/e2e.sh         # the built app, both engines (touches your windows)
-make bench                          # how long each engine stops a test app's main loop
+make test                           # Swift unit tests, the probe checks, the engine checks
+make testtools && tests/e2e.sh      # end-to-end: the engine driven by the probe
+make testtools && NOBORDER_E2E=app tests/e2e.sh         # the built app (touches your windows; quit NoBorder first)
+make bench                          # how long the engine stops a test app's main loop
 make release                        # build/NoBorder.zip for a GitHub release
 ```
 
 | Path | What it is |
 |---|---|
-| `app/Sources/NoBorderLogic` | the scanner, the tracker, the 250 ms scan loop, the engine switch |
+| `app/Sources/NoBorderLogic` | the scanner, the tracker, the 250 ms scan loop |
 | `app/Sources/NoBorderEngine` | task port, park check, generated arm64 call script, fault guard |
-| `app/Sources/NoBorder` | the menu bar app and the engine choice |
-| `app/Sources/NoBorderCore` | status, restart policy, the daemon's log pipe |
-| `noborder.py`, `windowstate.py`, `winscan.m` | the v1.1 engine: the daemon, its decisions, its scanner |
+| `app/Sources/NoBorder` | the menu bar app |
 | `tests/` | unit tests, the test app, the end-to-end, probe, engine and benchmark scripts |
 | `docs/` | website (GitHub Pages) |

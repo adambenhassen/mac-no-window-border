@@ -1,6 +1,6 @@
 import Darwin
 
-/// One engine that changes windows: the legacy Python/LLDB daemon behind it, or the native one.
+/// One engine that changes windows.
 ///
 /// `apply` and `restore` take the windows of one process in one call, because that is one stop in
 /// that app's main thread: a batch is applied as one call script, so a window is never half-changed
