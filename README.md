@@ -70,9 +70,9 @@ open /Applications/NoBorder.app
 
 The menu bar icon shows the status, and has **Enabled**,
 **Launch at Login** and **Quit**. The status line says how many windows NoBorder has changed.
-Turning it off, quitting, or the app being terminated restores the windows NoBorder changed; while
-it restores, the menu shows "Stopping: restoring windows…". A window whose app is busy at that
-moment is left as it is and asked about again while NoBorder is running.
+Turning it off, quitting, or the app being terminated restores the windows NoBorder changed. A
+window whose app is busy at that moment is left as it is and asked about again while NoBorder is
+running.
 
 Logs: `~/Library/Logs/macos-no-window-border.log`.
 
