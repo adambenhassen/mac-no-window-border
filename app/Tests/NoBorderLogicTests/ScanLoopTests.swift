@@ -25,7 +25,12 @@ final class ScanLoopTests: XCTestCase {
     /// Stands in for an engine: records every batch, hands back the windows it will not change, and
     /// logs the lines the real engine logs, through the closure the loop handed it.
     private final class FakeEngine: ChangeEngine {
-        struct Call: Equatable { let pid: pid_t; let windows: [UInt32]; let restoring: Bool }
+        struct Call: Equatable {
+            let pid: pid_t
+            let windows: [UInt32]
+            let restoring: Bool
+            var buttonsHidden = false
+        }
 
         var calls: [Call] = []
         var shutdowns = 0
@@ -41,15 +46,17 @@ final class ScanLoopTests: XCTestCase {
         init(log: @escaping (String) -> Void) { self.log = log }
 
         @discardableResult
-        func apply(pid: pid_t, windows: [UInt32]) -> [UInt32] { change(pid: pid, windows: windows, restoring: false) }
+        func apply(pid: pid_t, windows: [UInt32], buttonsHidden: Bool) -> [UInt32] {
+            change(pid: pid, windows: windows, restoring: false, buttonsHidden: buttonsHidden)
+        }
 
         @discardableResult
         func restore(pid: pid_t, windows: [UInt32]) -> [UInt32] { change(pid: pid, windows: windows, restoring: true) }
 
         @discardableResult
-        private func change(pid: pid_t, windows: [UInt32], restoring: Bool) -> [UInt32] {
+        private func change(pid: pid_t, windows: [UInt32], restoring: Bool, buttonsHidden: Bool = false) -> [UInt32] {
             enter()
-            calls.append(Call(pid: pid, windows: windows, restoring: restoring))
+            calls.append(Call(pid: pid, windows: windows, restoring: restoring, buttonsHidden: buttonsHidden))
             let batch = windows.map(String.init).joined(separator: " ")
             log(restoring ? "restoring \(batch)" : "applying \(batch)")
             if slow > 0 { Thread.sleep(forTimeInterval: slow) }
@@ -82,6 +89,8 @@ final class ScanLoopTests: XCTestCase {
     private var logs: [String] = []
     private var statuses: [Int] = []
     private var loop: ScanLoop!
+    /// The app's "hide window buttons" option, as the loop sees it.
+    private var hideButtons = false
 
     private func window(_ wid: UInt32 = 1, maximized: Bool = true, of pid: pid_t = 500) -> ScannedWindow {
         ScannedWindow(wid: wid, pid: pid, maximized: maximized)
@@ -98,6 +107,7 @@ final class ScanLoopTests: XCTestCase {
                        scan: scan.body,
                        tracker: WindowTracker(),
                        engine: engine,
+                       buttonsHidden: { [weak self] in self?.hideButtons ?? false },
                        log: { [weak self] line in self?.logs.append(line) },
                        status: { [weak self] n in self?.statuses.append(n) })
         forward.next = loop.engineLog()
@@ -214,6 +224,45 @@ final class ScanLoopTests: XCTestCase {
         engine.deferred = []
         cycles(from: 5.25, to: 10)
         XCTAssertEqual(statuses.last, 1, "and it does claim it once the change lands")
+    }
+
+    // MARK: - the window-buttons option
+
+    func testTogglingTheButtonsOptionReasksAppliedWindowsOnTheNextCycle() {
+        makeLoop()
+        scan.windows = [window()]
+        cycle(at: 0)
+        cycle(at: 0.5)
+        XCTAssertEqual(engine.calls, [FakeEngine.Call(pid: pid, windows: [1], restoring: false)])
+        hideButtons = true
+        cycle(at: 0.75)
+        XCTAssertEqual(engine.calls.last, FakeEngine.Call(pid: pid, windows: [1], restoring: false, buttonsHidden: true),
+                       "an applied window that disagrees with the option is applied again at once")
+        cycle(at: 1.0)
+        XCTAssertEqual(engine.calls.filter { $0.buttonsHidden }.count, 1, "and not asked over and over")
+        hideButtons = false
+        cycle(at: 1.25)
+        XCTAssertEqual(engine.calls.last, FakeEngine.Call(pid: pid, windows: [1], restoring: false, buttonsHidden: false),
+                       "turning the option off reaches the window that is staying maximized")
+    }
+
+    func testAButtonsChangeTheEngineDeferredIsAskedAgain() {
+        makeLoop()
+        scan.windows = [window()]
+        cycle(at: 0)
+        cycle(at: 0.5)
+        hideButtons = true
+        engine.deferred = [1]
+        cycles(from: 0.75, to: 5)
+        XCTAssertGreaterThanOrEqual(engine.calls.filter { $0.buttonsHidden }.count, 3,
+                                   "the app was busy, so every settle asks for the new buttons state")
+        engine.deferred = []
+        cycles(from: 5.25, to: 7)
+        XCTAssertEqual(engine.calls.last, FakeEngine.Call(pid: pid, windows: [1], restoring: false, buttonsHidden: true),
+                       "one of the later asks lands")
+        let asks = engine.calls.count
+        cycle(at: 10)
+        XCTAssertEqual(engine.calls.count, asks, "once it lands, asking stops")
     }
 
     // MARK: - the log the engine writes

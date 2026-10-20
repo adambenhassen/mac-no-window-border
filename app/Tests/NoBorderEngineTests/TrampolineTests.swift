@@ -141,6 +141,7 @@ final class TrampolineTests: XCTestCase {
         XCTAssertEqual(script.hasShadow, false)
         XCTAssertEqual(script.cornerRadius, 0.01)
         XCTAssertEqual(script.drawsDecoration, false)
+        XCTAssertEqual(script.hideButtons, false)
         XCTAssertEqual(script.windowNumbers, [42])
     }
 
@@ -149,6 +150,7 @@ final class TrampolineTests: XCTestCase {
         XCTAssertEqual(script.hasShadow, true)
         XCTAssertEqual(script.cornerRadius, 0.0)
         XCTAssertEqual(script.drawsDecoration, true)
+        XCTAssertEqual(script.hideButtons, false, "restoring shows the buttons as AppKit had them")
     }
 
     // MARK: the generated call sequence
@@ -157,8 +159,29 @@ final class TrampolineTests: XCTestCase {
         // [NSApplication sharedApplication] once, then per window:
         // [app windowWithWindowNumber:] + setHasShadow: + _setCornerRadius:
         //   + _titlebarContainerView + setDrawsDecorationView:
-        XCTAssertEqual(indirectCallCount(code(RemoteScript.applied(windowNumbers: [7]))), 6)
-        XCTAssertEqual(indirectCallCount(code(RemoteScript.applied(windowNumbers: [7, 8]))), 11)
+        //   + three standardWindowButton: each followed by setHidden:
+        XCTAssertEqual(indirectCallCount(code(RemoteScript.applied(windowNumbers: [7]))), 12)
+        XCTAssertEqual(indirectCallCount(code(RemoteScript.applied(windowNumbers: [7, 8]))), 23)
+    }
+
+    func testTheButtonStepAsksForEveryButton() {
+        let hidden = code(RemoteScript.applied(windowNumbers: [7], buttonsHidden: true))
+        let shown = code(RemoteScript.applied(windowNumbers: [7], buttonsHidden: false))
+        // The zoom button's index 2 is sent only by the standardWindowButton: step.
+        XCTAssertTrue(hidden.contains(Arc64.movz(dst: 2, value: 2)), "zoom is never asked for")
+        // setHidden: gets its argument: true three more times than the shown script asks for.
+        let trueArgs = Arc64.movz(dst: 2, value: 1)
+        XCTAssertEqual(hidden.filter { $0 == trueArgs }.count, shown.filter { $0 == trueArgs }.count + 3)
+        let data = blob(RemoteScript.applied(windowNumbers: [7], buttonsHidden: true))
+        XCTAssertTrue(hasCString(data, "standardWindowButton:"))
+        XCTAssertTrue(hasCString(data, "setHidden:"))
+    }
+
+    func testAScriptWithoutTheButtonFieldSaysNothingAboutButtons() {
+        var script = RemoteScript.applied(windowNumbers: [7])
+        script.hideButtons = nil
+        XCTAssertEqual(indirectCallCount(code(script)), 6)
+        XCTAssertFalse(hasCString(blob(script), "setHidden:"))
     }
 
     func testCodeHandsTheThreadBackInsteadOfWaitingForUs() {
@@ -233,8 +256,9 @@ final class TrampolineTests: XCTestCase {
         var script = RemoteScript.applied(windowNumbers: [7])
         script.cornerRadius = nil
         script.drawsDecoration = nil
-        // shared application + window lookup + setHasShadow:; the titlebar view is not looked up
-        XCTAssertEqual(indirectCallCount(code(script)), 3)
+        // shared application + window lookup + setHasShadow: + the six button calls;
+        // the titlebar view is not looked up
+        XCTAssertEqual(indirectCallCount(code(script)), 9)
     }
 
     // MARK: the data blob
@@ -243,7 +267,7 @@ final class TrampolineTests: XCTestCase {
         let data = blob(RemoteScript.applied(windowNumbers: [7]))
         for name in ["NSApplication", "sharedApplication", "windowWithWindowNumber:",
                      "setHasShadow:", "_setCornerRadius:", "_titlebarContainerView",
-                     "setDrawsDecorationView:"] {
+                     "setDrawsDecorationView:", "standardWindowButton:", "setHidden:"] {
             XCTAssertTrue(hasCString(data, name), "missing selector name \(name)")
         }
     }

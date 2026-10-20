@@ -9,6 +9,9 @@ public struct RemoteScript: Equatable {
     public var hasShadow: Bool?
     public var cornerRadius: Double?
     public var drawsDecoration: Bool?
+    /// Hide the close/miniaturize/zoom buttons, or show them again. A `nil` field means "do not
+    /// touch", like every other field: a script built without the option says nothing about buttons.
+    public var hideButtons: Bool?
     /// Test-only: makes the generated code jump to an address no process has mapped, so the fault
     /// guard has something to catch. Product code never sets it and nothing sets it by default.
     public var forceFaultForTesting = false
@@ -18,21 +21,27 @@ public struct RemoteScript: Equatable {
     /// which is exactly what the generated code would silently do nothing about.
     public var appKitProbe = false
 
-    public init(windowNumbers: [UInt32], hasShadow: Bool?, cornerRadius: Double?, drawsDecoration: Bool?) {
+    public init(windowNumbers: [UInt32], hasShadow: Bool?, cornerRadius: Double?, drawsDecoration: Bool?,
+                hideButtons: Bool? = nil) {
         self.windowNumbers = windowNumbers
         self.hasShadow = hasShadow
         self.cornerRadius = cornerRadius
         self.drawsDecoration = drawsDecoration
+        self.hideButtons = hideButtons
     }
 
-    /// The three changes: no outline/shadow, square corners, no titlebar rim.
-    public static func applied(windowNumbers: [UInt32]) -> RemoteScript {
-        RemoteScript(windowNumbers: windowNumbers, hasShadow: false, cornerRadius: 0.01, drawsDecoration: false)
+    /// The changes: no outline/shadow, square corners, no titlebar rim, and the window buttons hidden
+    /// or shown as asked. The buttons are always named — a script that shows them is how turning the
+    /// option off reaches a window that is staying maximized.
+    public static func applied(windowNumbers: [UInt32], buttonsHidden: Bool = false) -> RemoteScript {
+        RemoteScript(windowNumbers: windowNumbers, hasShadow: false, cornerRadius: 0.01, drawsDecoration: false,
+                     hideButtons: buttonsHidden)
     }
 
-    /// Back to exactly what AppKit had before: shadow on, default corner radius, rim drawn.
+    /// Back to exactly what AppKit had before: shadow on, default corner radius, rim drawn, buttons shown.
     public static func restored(windowNumbers: [UInt32]) -> RemoteScript {
-        RemoteScript(windowNumbers: windowNumbers, hasShadow: true, cornerRadius: 0.0, drawsDecoration: true)
+        RemoteScript(windowNumbers: windowNumbers, hasShadow: true, cornerRadius: 0.0, drawsDecoration: true,
+                     hideButtons: false)
     }
 
     /// Ask the target for its application object and nothing else.

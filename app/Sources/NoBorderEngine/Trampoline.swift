@@ -75,8 +75,9 @@ public enum Trampoline {
     static let msgSendRegister = 20
     static let appRegister = 21
     static let windowRegister = 27
-    static let titlebarRegister = 28
-    static let firstSelectorRegister = 22      // five of these, ending at x26
+    /// One register per selector, kept live across the whole window loop. x27 is the window, so it is
+    /// skipped; x28/x29 are callee-saved and the handback restores them.
+    static let selectorRegisters = [22, 23, 24, 25, 26, 28, 29]
     static let selLookupRegister = 16          // used only between loads and a lookup call
     static let classLookupRegister = 17
 
@@ -100,6 +101,10 @@ public enum Trampoline {
     static let cornerRadiusSelector = "_setCornerRadius:"
     static let titlebarSelector = "_titlebarContainerView"
     static let decorationSelector = "setDrawsDecorationView:"
+    static let standardButtonSelector = "standardWindowButton:"
+    static let setHiddenSelector = "setHidden:"
+    /// The NSWindowButton values: close, miniaturize, zoom.
+    static let buttonTypes: [UInt16] = [0, 1, 2]
 
     /// Where the data goes: just after the code, on an 8-byte boundary, because every read of it
     /// is an 8-byte load from the base register. The executor writes the data here and the code
@@ -155,6 +160,7 @@ public enum Trampoline {
         if script.hasShadow != nil { names.append(hasShadowSelector) }
         if script.cornerRadius != nil { names.append(cornerRadiusSelector) }
         if script.drawsDecoration != nil { names += [titlebarSelector, decorationSelector] }
+        if script.hideButtons != nil { names += [standardButtonSelector, setHiddenSelector] }
         return names
     }
 
@@ -238,16 +244,15 @@ public enum Trampoline {
             ops.append(.storeResult(from: appRegister))
         }
         // one selector lookup per message the script sends
+        precondition(selectorNames.count <= selectorRegisters.count, "one selector register per selector")
         for (index, name) in selectorNames.enumerated() {
             ops.append(.loadFromBlob(dst: selLookupRegister, blobOffset: blob.selRegisterName))
             ops.append(.adrBlob(dst: 0, offset: strings[name]!))
             ops.append(.call(reg: selLookupRegister))
-            ops.append(.move(dst: firstSelectorRegister + index, src: 0))
+            ops.append(.move(dst: selectorRegisters[index], src: 0))
         }
 
-        let selector = Dictionary(uniqueKeysWithValues: selectorNames.enumerated().map {
-            ($1, firstSelectorRegister + $0)
-        })
+        let selector = Dictionary(uniqueKeysWithValues: zip(selectorNames, selectorRegisters))
         let send = { (receiver: Int, name: String) -> [Op] in
             [.move(dst: 0, src: receiver), .move(dst: 1, src: selector[name]!)]
         }
@@ -270,12 +275,25 @@ public enum Trampoline {
                 ops.append(.call(reg: msgSendRegister))
             }
             if let drawsDecoration = script.drawsDecoration {
+                // The titlebar view arrives in x0 and is the receiver of the very next call, so it
+                // needs no register of its own: x1 and x2 are set after the lookup returns.
                 ops += send(windowRegister, titlebarSelector)
                 ops.append(.call(reg: msgSendRegister))
-                ops.append(.move(dst: titlebarRegister, src: 0))
-                ops += send(titlebarRegister, decorationSelector)
+                ops.append(.move(dst: 1, src: selector[decorationSelector]!))
                 ops.append(.movImm(dst: 2, value: drawsDecoration ? 1 : 0))
                 ops.append(.call(reg: msgSendRegister))
+            }
+            if let hideButtons = script.hideButtons {
+                // Each button arrives in x0 and receives setHidden: straight away. Sending to a nil
+                // button — a borderless window with none — is a no-op, as for every nil receiver.
+                for button in buttonTypes {
+                    ops += send(windowRegister, standardButtonSelector)
+                    ops.append(.movImm(dst: 2, value: button))
+                    ops.append(.call(reg: msgSendRegister))
+                    ops.append(.move(dst: 1, src: selector[setHiddenSelector]!))
+                    ops.append(.movImm(dst: 2, value: hideButtons ? 1 : 0))
+                    ops.append(.call(reg: msgSendRegister))
+                }
             }
         }
         // Hand the thread back to the app. The flag goes first: a caller that reads it knows every

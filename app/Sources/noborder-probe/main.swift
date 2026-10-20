@@ -1,7 +1,7 @@
 import Foundation
 import NoBorderEngine
 
-let usage = "usage: noborder-probe taskport|mainthread|park|threadinfo|runstate <pid> | run <pid> <wid> applied|restored [fault] | apply|restore <pid> <wid>…"
+let usage = "usage: noborder-probe taskport|mainthread|park|threadinfo|runstate <pid> | run <pid> <wid> applied|restored|buttons-hidden [fault] | apply|restore <pid> <wid>…"
 let args = CommandLine.arguments
 guard args.count >= 3, let pid = Int32(args[2]) else {
     print(usage)
@@ -82,6 +82,7 @@ case "run":
     switch args[4] {
     case "applied": script = RemoteScript.applied(windowNumbers: [wid])
     case "restored": script = RemoteScript.restored(windowNumbers: [wid])
+    case "buttons-hidden": script = RemoteScript.applied(windowNumbers: [wid], buttonsHidden: true)
     default: print(usage); exit(2)
     }
     script.forceFaultForTesting = args.count == 6
@@ -100,7 +101,7 @@ case "apply", "restore":
     let verb = args[1] == "apply" ? "applying" : "restoring"
     var lines: [String] = []
     let engine = NativeEngine(log: { print($0); lines.append($0) })
-    if args[1] == "apply" { engine.apply(pid: pid, windows: numbers) } else { engine.restore(pid: pid, windows: numbers) }
+    if args[1] == "apply" { engine.apply(pid: pid, windows: numbers, buttonsHidden: false) } else { engine.restore(pid: pid, windows: numbers) }
     engine.shutdown()
     exit(lines.contains { $0.hasPrefix(verb) } ? 0 : 1)
 default:

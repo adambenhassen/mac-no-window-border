@@ -12,6 +12,7 @@ struct NoBorderApp: App {
             Text(engines.status.menuText)
             Divider()
             Toggle("Enabled", isOn: Binding(get: { engines.enabled }, set: { engines.setEnabled($0) }))
+            Toggle("Hide window buttons", isOn: Binding(get: { engines.hideButtons }, set: { engines.setHideButtons($0) }))
             Toggle("Launch at Login", isOn: Binding(get: { launchAtLogin }, set: setLaunchAtLogin))
             if let loginError {
                 Text(loginError)

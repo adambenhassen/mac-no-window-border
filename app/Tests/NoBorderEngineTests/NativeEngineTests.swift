@@ -40,8 +40,14 @@ final class NativeEngineTests: XCTestCase {
     }
 
     func testApplyRunsOneCallScriptForTheWholeBatch() {
-        engine.apply(pid: 42, windows: [3, 5])
+        engine.apply(pid: 42, windows: [3, 5], buttonsHidden: false)
         XCTAssertEqual(runner.calls, [FakeRunner.Call(pid: 42, script: RemoteScript.applied(windowNumbers: [3, 5]))])
+    }
+
+    func testTheButtonsOptionIsCarriedIntoTheCallScript() {
+        engine.apply(pid: 42, windows: [3], buttonsHidden: true)
+        XCTAssertEqual(runner.calls, [FakeRunner.Call(pid: 42, script: RemoteScript.applied(windowNumbers: [3],
+                                                                                              buttonsHidden: true))])
     }
 
     func testRestoreRunsOneCallScriptForTheWholeBatch() {
@@ -50,16 +56,16 @@ final class NativeEngineTests: XCTestCase {
     }
 
     func testAnEmptyBatchIsNotACall() {
-        engine.apply(pid: 42, windows: [])
+        engine.apply(pid: 42, windows: [], buttonsHidden: false)
         engine.restore(pid: 42, windows: [])
         XCTAssertEqual(runner.calls, [])
         XCTAssertEqual(logs, [])
     }
 
     func testApplyingIsLoggedOncePerBatchWithItsWindows() {
-        engine.apply(pid: 42, windows: [3, 5])
+        engine.apply(pid: 42, windows: [3, 5], buttonsHidden: false)
         XCTAssertEqual(logs, ["applying 3 5"])
-        engine.apply(pid: 42, windows: [7])
+        engine.apply(pid: 42, windows: [7], buttonsHidden: false)
         XCTAssertEqual(logs, ["applying 3 5", "applying 7"])
     }
 
@@ -70,7 +76,7 @@ final class NativeEngineTests: XCTestCase {
 
     func testAnAppThatIsNotParkedIsDeferredAndNotClaimedAsChanged() {
         runner.outcome = CallOutcome(result: .notParked, word: nil)
-        engine.apply(pid: 42, windows: [3])
+        engine.apply(pid: 42, windows: [3], buttonsHidden: false)
         XCTAssertEqual(logs, ["skipped (not parked) 42 3"])
         XCTAssertFalse(logs.contains { $0.hasPrefix("applying") }, "the call never ran")
     }
@@ -80,12 +86,12 @@ final class NativeEngineTests: XCTestCase {
     /// tracker will not ask again for a window it believes is applied.
     func testTheWindowsADeferredRunLeftUnchangedAreHandedBack() {
         runner.outcome = CallOutcome(result: .notParked, word: nil)
-        XCTAssertEqual(engine.apply(pid: 42, windows: [3, 5]), [3, 5], "the whole batch, because none of it ran")
+        XCTAssertEqual(engine.apply(pid: 42, windows: [3, 5], buttonsHidden: false), [3, 5], "the whole batch, because none of it ran")
         XCTAssertEqual(engine.restore(pid: 42, windows: [3, 5]), [3, 5])
     }
 
     func testAChangeThatHappenedHandsBackNothing() {
-        XCTAssertEqual(engine.apply(pid: 42, windows: [3]), [])
+        XCTAssertEqual(engine.apply(pid: 42, windows: [3], buttonsHidden: false), [])
         XCTAssertEqual(engine.restore(pid: 42, windows: [3]), [])
     }
 
@@ -93,52 +99,52 @@ final class NativeEngineTests: XCTestCase {
     /// would ask the same engine to fault again. The spec's "marks the window and moves on".
     func testAFaultIsNotADeferredWindow() {
         runner.outcome = CallOutcome(result: .faulted, word: nil)
-        XCTAssertEqual(engine.apply(pid: 42, windows: [3]), [])
+        XCTAssertEqual(engine.apply(pid: 42, windows: [3], buttonsHidden: false), [])
     }
 
     func testATargetTheEngineCannotReachIsNotADeferredWindow() {
         runner.outcome = CallOutcome(result: .failed("task port denied"), word: nil)
-        XCTAssertEqual(engine.apply(pid: 42, windows: [3]), [])
+        XCTAssertEqual(engine.apply(pid: 42, windows: [3], buttonsHidden: false), [])
     }
 
     /// A probe that could not run leaves the batch unjudged, and the next scan asks again: so the
     /// windows are handed back, exactly as for a change that could not run.
     func testADeferredProbeHandsTheWindowsBack() {
         runner.probeOutcome = CallOutcome(result: .notParked, word: nil)
-        XCTAssertEqual(engine.apply(pid: 42, windows: [3]), [3])
+        XCTAssertEqual(engine.apply(pid: 42, windows: [3], buttonsHidden: false), [3])
     }
 
     func testAFaultIsReportedAsAFailedEngineNotAsAChange() {
         runner.outcome = CallOutcome(result: .faulted, word: nil)
-        engine.apply(pid: 42, windows: [3])
+        engine.apply(pid: 42, windows: [3], buttonsHidden: false)
         XCTAssertEqual(logs, ["engine failed 42 3"])
     }
 
     func testAReasonFromTheRunnerIsCarriedIntoTheLog() {
         runner.outcome = CallOutcome(result: .failed("task port denied"), word: nil)
-        engine.apply(pid: 42, windows: [3])
+        engine.apply(pid: 42, windows: [3], buttonsHidden: false)
         XCTAssertEqual(logs, ["engine failed 42 3: task port denied"])
     }
 
     func testATargetWithoutAppKitIsRefusedAndItsWindowsNeverTouched() {
         runner.appKitWord = 0
-        engine.apply(pid: 42, windows: [3])
+        engine.apply(pid: 42, windows: [3], buttonsHidden: false)
         XCTAssertEqual(logs, ["skipped (not AppKit) 42 3"])
         XCTAssertEqual(runner.calls, [])
     }
 
     func testTheAppKitCheckRunsOncePerTargetAndIsForgottenOnShutdown() {
-        engine.apply(pid: 42, windows: [3])
-        engine.apply(pid: 42, windows: [4])
-        engine.apply(pid: 99, windows: [5])
+        engine.apply(pid: 42, windows: [3], buttonsHidden: false)
+        engine.apply(pid: 42, windows: [4], buttonsHidden: false)
+        engine.apply(pid: 99, windows: [5], buttonsHidden: false)
         XCTAssertEqual(runner.probes, [42, 99])
         engine.shutdown()
-        engine.apply(pid: 42, windows: [3])
+        engine.apply(pid: 42, windows: [3], buttonsHidden: false)
         XCTAssertEqual(runner.probes, [42, 99, 42], "shutdown releases what the engine knew about a pid")
     }
 
     func testShutdownIsForwardedToTheRunnerThatHoldsTheTaskPorts() {
-        engine.apply(pid: 42, windows: [3])
+        engine.apply(pid: 42, windows: [3], buttonsHidden: false)
         engine.shutdown()
         XCTAssertEqual(runner.shutdowns, 1)
     }
@@ -147,17 +153,17 @@ final class NativeEngineTests: XCTestCase {
         // A probe that could not run says nothing about AppKit: the batch is reported for the reason
         // the runner gave, and the next scan asks again.
         runner.probeOutcome = CallOutcome(result: .notParked, word: nil)
-        engine.apply(pid: 42, windows: [3])
+        engine.apply(pid: 42, windows: [3], buttonsHidden: false)
         XCTAssertEqual(logs, ["skipped (not parked) 42 3"])
-        engine.apply(pid: 42, windows: [3])
+        engine.apply(pid: 42, windows: [3], buttonsHidden: false)
         XCTAssertEqual(runner.probes, [42, 42], "the judgement is not made from a run that did not happen")
         XCTAssertEqual(runner.calls, [], "and the windows were not touched on the way")
     }
 
     func testARefusedTargetIsRememberedAcrossBatches() {
         runner.appKitWord = 0
-        engine.apply(pid: 42, windows: [3])
-        engine.apply(pid: 42, windows: [4])
+        engine.apply(pid: 42, windows: [3], buttonsHidden: false)
+        engine.apply(pid: 42, windows: [4], buttonsHidden: false)
         XCTAssertEqual(runner.probes, [42], "the answer does not change between scans")
         // Every refusal is reported: the engine has no policy of its own about how often to say it,
         // and deduplicating a permanent one in the app's log is the scan loop's job (Task 10).

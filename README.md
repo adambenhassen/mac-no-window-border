@@ -32,6 +32,8 @@
 - **Square corners:** a maximized window meets the screen edge with no wallpaper showing through.
 - **No titlebar rim:** removes the light highlight along the titlebar's top edge (and the line
   under the titlebar).
+- **Window buttons, optional:** a menu toggle hides the close/minimize/zoom buttons on maximized
+  windows, and shows them again when it is turned off — including on a window that never left.
 - **Maximized windows only:** a window counts as maximized when it fills its screen's usable area
   (below the menu bar, beside the Dock). Every other window keeps the normal macOS look.
 - **Reversible:** a window that stops being maximized gets back exactly what NoBorder changed. If
@@ -68,8 +70,9 @@ open /Applications/NoBorder.app
 
 ## Usage
 
-The menu bar icon shows the status, and has **Enabled**,
-**Launch at Login** and **Quit**. The status line says how many windows NoBorder has changed.
+The menu bar icon shows the status, and has **Enabled**, **Hide window buttons**,
+**Launch at Login** and **Quit**. The buttons option takes effect on the next scan (a quarter
+second) and is remembered between runs. The status line says how many windows NoBorder has changed.
 Turning it off, quitting, or the app being terminated restores the windows NoBorder changed. A
 window whose app is busy at that moment is left as it is and asked about again while NoBorder is
 running.

@@ -17,10 +17,10 @@ final class WindowTrackerTests: XCTestCase {
     /// Scan the same windows at `from` and one second later (past both settles); return the second
     /// scan's decision. The port of `settle` in the Python tests.
     @discardableResult
-    private func settle(_ tracker: WindowTracker, _ windows: [ScannedWindow], from: TimeInterval = 0)
-        -> TrackerDecision {
-        _ = tracker.update(windows: windows, at: from)
-        return tracker.update(windows: windows, at: from + 1.0)
+    private func settle(_ tracker: WindowTracker, _ windows: [ScannedWindow], from: TimeInterval = 0,
+                        buttonsHidden: Bool = false) -> TrackerDecision {
+        _ = tracker.update(windows: windows, at: from, buttonsHidden: buttonsHidden)
+        return tracker.update(windows: windows, at: from + 1.0, buttonsHidden: buttonsHidden)
     }
 
     private func assertNothing(_ decision: TrackerDecision, _ message: String = "no window should be chosen") {
@@ -125,6 +125,24 @@ final class WindowTrackerTests: XCTestCase {
         assertNothing(tracker.update(windows: [window()], at: 0.8),
                       "the settle runs from the moment it came back, not from before it left")
         XCTAssertEqual(tracker.update(windows: [window()], at: 0.9).apply, [pid: [1]])
+    }
+
+    // MARK: - the window-buttons option
+
+    func testAnAppliedWindowWhoseButtonsStateChangedIsAppliedAgainAtOnce() {
+        let tracker = WindowTracker()
+        XCTAssertEqual(settle(tracker, [window()], from: 0, buttonsHidden: true).apply, [pid: [1]])
+        assertNothing(tracker.update(windows: [window()], at: 1.0, buttonsHidden: true), "nothing to do")
+        XCTAssertEqual(tracker.update(windows: [window()], at: 1.1, buttonsHidden: false).apply, [pid: [1]],
+                       "the option changed while the window stayed maximized: asked on the spot")
+        assertNothing(tracker.update(windows: [window()], at: 1.2, buttonsHidden: false), "the ask is remembered")
+    }
+
+    func testTheButtonsStateOfANewApplyIsRemembered() {
+        let tracker = WindowTracker()
+        XCTAssertEqual(settle(tracker, [window()], from: 0, buttonsHidden: true).apply, [pid: [1]])
+        assertNothing(tracker.update(windows: [window()], at: 5.0, buttonsHidden: true),
+                      "an applied window asked for hidden buttons needs nothing while the option is on")
     }
 
     // MARK: - a batch the engine did not run

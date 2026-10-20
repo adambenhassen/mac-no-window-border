@@ -24,11 +24,16 @@ public final class ScanLoop {
     /// the app that knows what the user is being shown.
     public typealias Status = (_ windowsChanged: Int) -> Void
 
+    /// The current "hide window buttons" option, read fresh every cycle: turning it off while a
+    /// window stays maximized has to reach that window, and it is this closure that says so.
+    public typealias ButtonsSetting = () -> Bool
+
     private let interval: TimeInterval
     private let now: Clock
     private let scan: Scan
     private let tracker: WindowTracker
     private let engine: ChangeEngine
+    private let buttonsHidden: ButtonsSetting
     private let emit: Log
     private let status: Status
 
@@ -52,6 +57,7 @@ public final class ScanLoop {
                 scan: @escaping Scan,
                 tracker: WindowTracker = WindowTracker(),
                 engine: ChangeEngine,
+                buttonsHidden: @escaping ButtonsSetting = { false },
                 log: @escaping Log,
                 status: @escaping Status = { _ in }) {
         self.interval = interval
@@ -59,6 +65,7 @@ public final class ScanLoop {
         self.scan = scan
         self.tracker = tracker
         self.engine = engine
+        self.buttonsHidden = buttonsHidden
         self.emit = log
         self.status = status
     }
@@ -130,15 +137,16 @@ public final class ScanLoop {
 
     private func cycle() {
         let at = now()
-        let decision = tracker.update(windows: scan(), at: at)
+        let hidden = buttonsHidden()
+        let decision = tracker.update(windows: scan(), at: at, buttonsHidden: hidden)
         // Restores before applies: a window the user un-maximized is theirs to have back, and a
         // process that goes busy in the middle then only has the apply deferred.
         for (pid, wids) in decision.restore.sorted(by: { $0.key < $1.key }) {
             let deferred = engine.restore(pid: pid, windows: wids)
-            if !deferred.isEmpty { tracker.undoRestore(deferred, of: pid) }
+            if !deferred.isEmpty { tracker.undoRestore(deferred, of: pid, buttonsHidden: hidden) }
         }
         for (pid, wids) in decision.apply.sorted(by: { $0.key < $1.key }) {
-            let deferred = engine.apply(pid: pid, windows: wids)
+            let deferred = engine.apply(pid: pid, windows: wids, buttonsHidden: hidden)
             if !deferred.isEmpty { tracker.undoApply(deferred) }
         }
         status(tracker.appliedCount)

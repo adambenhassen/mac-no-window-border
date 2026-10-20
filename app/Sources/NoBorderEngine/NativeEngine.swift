@@ -12,8 +12,8 @@ public struct CallOutcome: Equatable {
     }
 }
 
-/// The three changes, made inside the app's own main thread in one stop: no outline/shadow, square
-/// corners, no titlebar rim.
+/// The changes, made inside the app's own main thread in one stop: no outline/shadow, square
+/// corners, no titlebar rim, and — when the app's option asks — the window buttons hidden.
 ///
 /// The engine decides *what* a batch of windows becomes — one call script per batch, so a window is
 /// never half-changed — and what is said about each outcome. Running that script in a live process
@@ -47,8 +47,9 @@ public final class NativeEngine: ChangeEngine {
     }
 
     @discardableResult
-    public func apply(pid: pid_t, windows: [UInt32]) -> [UInt32] {
-        change(.applied(windowNumbers: windows), pid: pid, windows: windows, verb: "applying")
+    public func apply(pid: pid_t, windows: [UInt32], buttonsHidden: Bool) -> [UInt32] {
+        change(.applied(windowNumbers: windows, buttonsHidden: buttonsHidden), pid: pid, windows: windows,
+               verb: "applying")
     }
 
     @discardableResult

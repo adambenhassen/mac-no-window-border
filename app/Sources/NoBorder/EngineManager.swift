@@ -8,11 +8,28 @@ import NoBorderLogic
 ///
 /// The window changes themselves are made inside the apps that own them: see `ScanLoop` and
 /// `NativeEngine`.
+/// The "hide window buttons" option, readable from the scan loop's queue. The menu writes it; the
+/// loop's cycle reads it. A lock makes that handoff a plain fact, not a race to reason about.
+final class ButtonSetting {
+    private let lock = NSLock()
+    private var hidden = false
+
+    var isOn: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return hidden }
+        set { lock.lock(); hidden = newValue; lock.unlock() }
+    }
+
+    init(on: Bool) { hidden = on }
+}
+
 @MainActor
 final class EngineManager: ObservableObject {
     @Published private(set) var status: EngineStatus = .off
     @Published private(set) var enabled: Bool
+    @Published private(set) var hideButtons: Bool
 
+    /// Shared with the scan loop, which reads it on its own queue every cycle.
+    private let buttonSetting: ButtonSetting
     private var loop: ScanLoop?
     private var log: FileHandle? = LogFile.open()
 
@@ -25,6 +42,9 @@ final class EngineManager: ObservableObject {
 
     init() {
         enabled = UserDefaults.standard.object(forKey: "enabled") as? Bool ?? true
+        let buttons = UserDefaults.standard.bool(forKey: "hideButtons")
+        hideButtons = buttons
+        buttonSetting = ButtonSetting(on: buttons)
         // A Dock quit, a Cmd-Q, a "Quit" from anywhere: the windows we changed go back before the
         // process goes, which is the whole reason the app is the one making the changes.
         NotificationCenter.default.addObserver(
@@ -39,6 +59,14 @@ final class EngineManager: ObservableObject {
         enabled = on
         UserDefaults.standard.set(on, forKey: "enabled")
         if on { start() } else { stop() }
+    }
+
+    /// The buttons option takes effect on the next scan (≤250 ms): the loop reads it fresh every
+    /// cycle, and an applied window that disagrees with it is applied again with the new value.
+    func setHideButtons(_ on: Bool) {
+        hideButtons = on
+        buttonSetting.isOn = on
+        UserDefaults.standard.set(on, forKey: "hideButtons")
     }
 
     /// Quit: put the user's windows back first, then leave.
@@ -58,6 +86,7 @@ final class EngineManager: ObservableObject {
         let newLoop = ScanLoop(scan: { WindowScan.scan() },
                                tracker: WindowTracker(),
                                engine: engine,
+                               buttonsHidden: { [buttonSetting] in buttonSetting.isOn },
                                log: { [weak self] line in
                                    DispatchQueue.main.async { MainActor.assumeIsolated { self?.write(line) } }
                                },

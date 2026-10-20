@@ -50,10 +50,18 @@ public final class WindowTracker {
     private let restoreSettle: TimeInterval
     private let maxRecords: Int
 
-    /// wid -> the process whose window we changed. The record of a change we owe the user: only a
-    /// window in here is ever restored, and it is restored to the process recorded here, not to
-    /// whoever owns that window number now.
-    private var applied: [UInt32: pid_t] = [:]
+    /// One window's record of a change we owe the user.
+    private struct AppliedRecord {
+        let pid: pid_t
+        /// The buttons state we asked the engine for. The option can change while a window stays
+        /// maximized, and this is what says the window needs asking again.
+        var buttonsHidden: Bool
+    }
+
+    /// wid -> the change we made to it. The record of a change we owe the user: only a window in
+    /// here is ever restored, and it is restored to the process recorded here, not to whoever owns
+    /// that window number now.
+    private var applied: [UInt32: AppliedRecord] = [:]
 
     /// wid -> (the state it has to keep for the settle to end, the moment it started keeping it).
     private var pending: [UInt32: (state: Bool, since: TimeInterval)] = [:]
@@ -80,18 +88,33 @@ public final class WindowTracker {
     /// The engine did not restore these windows, so they are still showing our change: put the records
     /// back. A window we have changed and failed to put back is the Phase 1 "windows left changed"
     /// outcome, which the Phase 2 spec says must not exist; the next scan asks again.
-    public func undoRestore(_ windows: [UInt32], of pid: pid_t) {
+    public func undoRestore(_ windows: [UInt32], of pid: pid_t, buttonsHidden: Bool = false) {
         for wid in windows {
-            applied[wid] = pid
+            applied[wid] = AppliedRecord(pid: pid, buttonsHidden: buttonsHidden)
             pending.removeValue(forKey: wid)
         }
     }
 
-    public func update(windows: [ScannedWindow], at now: TimeInterval) -> TrackerDecision {
+    /// `buttonsHidden` is the app's current option. An applied window that disagrees with it is applied
+    /// again on the spot: the window's state is not what changed, the user's option is, and the settle
+    /// guards a drag — not a resync of a window that has been at rest and ours for as long as we have
+    /// the record.
+    public func update(windows: [ScannedWindow], at now: TimeInterval, buttonsHidden: Bool = false) -> TrackerDecision {
         var decision = TrackerDecision()
         var seen: Set<UInt32> = []
         for window in windows {
             seen.insert(window.wid)
+            if window.maximized, var record = applied[window.wid] {
+                // Ours and still filling the area. The option is the only thing that can ask for more.
+                guard record.buttonsHidden != buttonsHidden else {
+                    pending.removeValue(forKey: window.wid)
+                    continue
+                }
+                record.buttonsHidden = buttonsHidden
+                applied[window.wid] = record
+                decision.apply[window.pid, default: []].append(window.wid)
+                continue
+            }
             let isOurs = applied[window.wid] != nil
             if window.maximized == isOurs {
                 // Nothing to do: un-maximized and not ours, or maximized and already changed. A
@@ -113,10 +136,10 @@ public final class WindowTracker {
             if now - waiting.since < settle { continue }
             pending.removeValue(forKey: window.wid)
             if window.maximized {
-                applied[window.wid] = window.pid
+                applied[window.wid] = AppliedRecord(pid: window.pid, buttonsHidden: buttonsHidden)
                 decision.apply[window.pid, default: []].append(window.wid)
             } else {
-                let owner = applied.removeValue(forKey: window.wid)!
+                let owner = applied.removeValue(forKey: window.wid)!.pid
                 decision.restore[owner, default: []].append(window.wid)
             }
         }
@@ -145,8 +168,8 @@ public final class WindowTracker {
     /// loop calls with; a restore-all is immediate and settles nothing.
     public func restoreAll(at now: TimeInterval) -> [pid_t: [UInt32]] {
         var restored: [pid_t: [UInt32]] = [:]
-        for (wid, owner) in applied {
-            restored[owner, default: []].append(wid)
+        for (wid, record) in applied {
+            restored[record.pid, default: []].append(wid)
         }
         for (owner, wids) in restored {
             restored[owner] = wids.sorted()  // a stable order, so a run can be compared with a run

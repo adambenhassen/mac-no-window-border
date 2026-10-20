@@ -17,8 +17,12 @@ public protocol ChangeEngine: AnyObject {
     ///
     /// The caller needs the answer, not the log line: it has already written these windows off as
     /// changed, and a window the engine never touched has to be handed back or it is never changed.
+    ///
+    /// `buttonsHidden` is the app's current option: applied windows show the buttons or not as it
+    /// says, and a window that is already applied and needs only the option changed is applied again
+    /// with the new value.
     @discardableResult
-    func apply(pid: pid_t, windows: [UInt32]) -> [UInt32]
+    func apply(pid: pid_t, windows: [UInt32], buttonsHidden: Bool) -> [UInt32]
 
     /// Put these windows of one process back, in one stop. Same contract as `apply`.
     @discardableResult
