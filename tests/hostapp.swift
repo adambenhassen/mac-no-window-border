@@ -1,6 +1,8 @@
 // Test app for tests/e2e.sh: one window filling the primary screen's usable area ("max") and
 // one floating window, both dark. Prints "<name> <wid>" per window, then idles.
 // SIGUSR1 shrinks "max" to 600x400; SIGUSR2 makes it fill the usable area again.
+// SIGCONT focuses "max" (the app activates, the window becomes key); SIGWINCH defocuses it
+// (the window goes back, the app deactivates). A focus cycle is the window's key state changing.
 // With the "busy" argument (tests/idle.sh), the main thread keeps running ~50 ms blocks and
 // almost never waits in its run loop; SIGHUP stops that, so the app becomes idle.
 // With the "spin" argument (tests/engine.sh), the main thread never comes back to its run loop at
@@ -44,6 +46,21 @@ for (sig, frame) in [(SIGUSR1, small), (SIGUSR2, usable)] {
     signal(sig, SIG_IGN)
     let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
     source.setEventHandler { maxWindow.setFrame(frame, display: true) }
+    source.resume()
+    sources.append(source)
+}
+for (sig, focus) in [(SIGCONT, true), (SIGWINCH, false)] {
+    signal(sig, SIG_IGN)
+    let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+    source.setEventHandler {
+        if focus {
+            NSApp.activate(ignoringOtherApps: true)
+            maxWindow.makeKeyAndOrderFront(nil)
+        } else {
+            maxWindow.orderBack(nil)
+            NSApp.deactivate()
+        }
+    }
     source.resume()
     sources.append(source)
 }
