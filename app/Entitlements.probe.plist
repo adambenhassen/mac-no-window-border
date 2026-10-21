@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- task_for_pid on other apps' processes: the probe and the test tools (tests/probe.sh,
+	     agent.sh, blobagent.sh, focus.sh) drive the engine by hand and need it. The shipped app
+	     carries the same entitlement (see app/Entitlements.plist) now that it runs on the
+	     resident agent. -->
+	<key>com.apple.security.cs.debugger</key>
+	<true/>
+</dict>
+</plist>

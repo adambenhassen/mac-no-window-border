@@ -156,53 +156,107 @@ app_mode() {
         app=""
     }
 
-    # The engine in the app: the same window, the same pixels, judged through the app's log.
-    # The app's own lines are timestamped, so the patterns are not anchored.
+    # The resident-agent app (blob engine, publication decision 2026-10-21): changes are
+    # messages to the agent installed in each tracked app. The contract, judged through the
+    # app's log, the target's regions, and the window's own pixels: it says what it is, once;
+    # it applies the maximized window over scan and focus flap with no deferral storm and no
+    # engine failure; the agent pages appear in the target; quit restores the window and
+    # removes the agent. The app's lines are timestamped, so patterns are not anchored.
+    # Hermeticity: the log is shared by every instance and the scan is machine-wide, so a
+    # stray running app makes these gates lie (measured 2026-10-21: a live instance's lines
+    # answered the mode-line await and its retry refusals tripped the failure gate).
+    if pgrep -x NoBorder > /dev/null; then
+        echo "FAIL the app-mode gate needs the machine to itself: a NoBorder instance is running"
+        fail=1
+        return
+    fi
+    local regs0=$(vmmap $host 2>/dev/null | grep -c "VM_ALLOCATE.* r-x/")
     runapp app
-    if await "applying $max\$"; then
-        echo "PASS app logs applying: $(applog | grep "applying $max" | head -1)"
+    if await "resident agent: changes are messages"; then
+        echo "PASS app declares the resident agent: $(applog | grep "resident agent:" | head -1)"
     else
-        echo "FAIL app never applied the maximized window: $(applog | tail -5)"
+        echo "FAIL app never declared the resident agent: $(applog | tail -5)"
         fail=1
     fi
+    kill -CONT $host; sleep 1.2          # focus kick
+    kill -WINCH $host; sleep 0.6
+    # The agent's engine speaks `applying` when a change lands, so the failure gate names only
+    # failures — scoped to the FIXTURE's pid: the app scans every app on the machine, and a
+    # busy live app outside the fixture refusing its install (measured 2026-10-21: an Electron
+    # wrapper's `entry-timed-out`) is machine state, not the fixture's verdict.
+    local runs=$(applog | grep -cE "engine (failed|refused) $host([^0-9]|$)|left alone $host([^0-9]|$)|op result $host([^0-9]|$).*nil\(")
+    [[ "$runs" == 0 ]] && echo "PASS zero engine-failure lines over scan and focus flap" \
+        || { echo "FAIL the engine reported failures: $(applog | grep -E "engine (failed|refused) $host([^0-9]|$)|left alone $host([^0-9]|$)|op result $host([^0-9]|$).*nil\(" | head -3)"; fail=1; }
+    # The apply lands on the scan after the install (the install's dispatched entry can
+    # cost seconds, measured 2026-10-21), so the pixels are awaited, not sampled once.
+    for i in 1 2 3 4 5 6 7 8; do probe_px; [[ "$px" == "square=1 rim=0" ]] && break; sleep 1; done
+    [[ "$px" == "square=1 rim=0" ]] && echo "PASS app applied the maximized window through the agent: $px" \
+        || { echo "FAIL the app did not apply the window: $px"; fail=1; }
+    # The agent's code page is a VM_ALLOCATE 16K r-x region (the state page is rw), counted
+    # BASELINE-RELATIVE: a hostapp's plain VM_ALLOCATE count drifts by ±1-3 over a session
+    # (measured 2026-10-21: post-quit 5 against a baseline of 4 with the agent fully gone),
+    # and MALLOC_TINY baselines of 12–18 made the old absolute gates read install at
+    # baseline and a full install as noise. r-x is the agent's fingerprint.
+    local regs=$(vmmap $host 2>/dev/null | grep -c "VM_ALLOCATE.* r-x/")
+    [[ "$regs" -ge $((regs0 + 1)) ]] && echo "PASS the agent's pages are mapped in the target: $regs vm_allocate (baseline $regs0)" \
+        || { echo "FAIL no agent regions in the target: $regs (baseline $regs0)"; fail=1; }
+    local mode=$(applog | grep -c "resident agent:")
+    [[ "$mode" == 1 ]] && echo "PASS the mode line is said exactly once: $mode" \
+        || { echo "FAIL mode line said $mode times"; fail=1; }
+
+    # Quit (SIGTERM → the app's stop): exits promptly, restores the window, removes the agent.
+    stopapp
     probe_px
-    [[ "$px" == "square=1 rim=0" ]] && echo "PASS app squares the window: $px" \
-        || { echo "FAIL app pixels: got '$px', want 'square=1 rim=0'"; fail=1; }
-    windowShot $out/app-applied.png
-    band=$(windowBand $out/app-pre.png $out/app-applied.png)
-    verdict=$(windowVerdict $band)
-    [[ "$verdict" == "changed=1"* ]] && echo "PASS app changed the window's own pixels: $verdict" \
-        || { echo "FAIL app left the window's pixels unchanged: $band ($verdict)"; fail=1; }
+    [[ "$px" == "square=0 rim=1" ]] && echo "PASS quit restored the window: $px" \
+        || { echo "FAIL quit left the window changed: $px"; fail=1; }
+    local regs_after=$(vmmap $host 2>/dev/null | grep -c "VM_ALLOCATE.* r-x/")
+    [[ "$regs_after" -le $regs0 ]] && echo "PASS quit removed the agent's pages: $regs_after vm_allocate (baseline $regs0)" \
+        || { echo "FAIL agent pages survive quit: $regs_after (baseline $regs0)"; fail=1; }
 
-    kill -USR1 $host
-    if await "restoring $max\$"; then
-        echo "PASS app logs restoring after un-maximizing: $(applog | grep "restoring $max" | head -1)"
-    else
-        echo "FAIL app did not restore the un-maximized window: $(applog | tail -5)"
-        fail=1
-    fi
-    probe_px
-    [[ "$px" == "square=0 rim=1" ]] && echo "PASS app puts the window back: $px" \
-        || { echo "FAIL app after restore: got '$px', want 'square=0 rim=1'"; fail=1; }
-    # No pixel-band comparison here, on purpose: un-maximizing resizes the window, so the pre
-    # capture (maximized) and this one (its own frame) are not the same picture. The probe path, which
-    # leaves the window maximized, is where the band proves the change is fully undone.
-
-    # The log says every refusal once per process, not once per scan (four a second would bury it).
-    local refusals=$(applog | grep -c "skipped (not AppKit)")
-    local pids=$(applog | awk '$4=="(not" && $5=="AppKit)" {print $6}' | sort -u | wc -l | tr -d ' ')
-    [[ "$refusals" == "$pids" ]] && echo "PASS app says each refusal once per process: $refusals for $pids processes" \
-        || { echo "FAIL app repeats refusals: $refusals lines for $pids processes"; fail=1; }
-
-    # Never act on a window we did not apply: the 600x400 window is on screen, is not maximized, and
-    # the loop scans every window it can see. It must never be named in the log, and none of its
-    # pixels may have moved while the loop ran next to it.
+    # The floating window is on screen, is not maximized, and the loop scans every window it can
+    # see: it must never be named in the log, and none of its pixels may have moved.
     local named=$(applog | grep -cE "(^| )$float( |$)")
     float_px
     [[ "$named" == "0" && "$px" == "square=0 rim=1" ]] \
         && echo "PASS app never touches the floating window: $named lines, $px" \
         || { echo "FAIL app acted on the floating window: $named lines, got '$px'"; fail=1; }
+
+    # Verdict 4 (codex, 2026-10-20), two more.
+    # 1. Session startup names the mode with NOTHING to do: a hostapp started "small", whose
+    #    windows never qualify. The line is the session speaking, not an apply.
+    kill $host 2>/dev/null; wait $host 2>/dev/null
+    ./tests/hostapp small > $out/host-small.txt & host=$!
+    sleep 1.5
+    runapp app
+    if await "resident agent: changes are messages"; then
+        echo "PASS the mode is said at session start with no qualifying window"
+    else
+        echo "FAIL no mode line with a nonqualifying scan: $(applog | tail -3)"
+        fail=1
+    fi
+    local runs2=$(applog | grep -cE "applying|restoring|engine failed|left alone")
+    [[ "$runs2" == 0 ]] && echo "PASS nonqualifying scan: zero engine lines" \
+        || { echo "FAIL nonqualifying scan produced engine lines: $(applog | grep -E "applying|restoring|engine failed|left alone" | head -3)"; fail=1; }
     stopapp
+
+    # 2. A window an older, injecting build left changed: quit does NOT undo it — the mode line
+    #    says so, and the probe's restore mode is the way back. The probe stands in for the
+    #    older build's applied state here; the app must leave it exactly as it found it.
+    kill $host 2>/dev/null; wait $host 2>/dev/null
+    ./tests/hostapp > $out/host3.txt & host=$!
+    sleep 1.5
+    max=$(awk '$1=="max" {print $2; exit}' $out/host3.txt)
+    float=$(awk '$1=="floating" {print $2; exit}' $out/host3.txt)
+    build/noborder-probe apply $host $max > $out/prechange.out
+    probe_px
+    [[ "$px" == "square=1 rim=0" ]] && echo "PASS fixture: window pre-changed by the probe: $px" \
+        || { echo "FAIL pre-change fixture: $px"; fail=1; }
+    runapp app
+    await "resident agent: changes are messages" > /dev/null
+    stopapp
+    probe_px
+    [[ "$px" == "square=1 rim=0" ]] && echo "PASS quit left the pre-changed window as it found it: $px" \
+        || { echo "FAIL quit undid the pre-change: $px"; fail=1; }
 }
 
 host=""

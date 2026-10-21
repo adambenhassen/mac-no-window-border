@@ -39,6 +39,18 @@ squared() {  # squared <wid> -> "square=…" field of tests/winpixels for that w
     tests/winpixels build/engine.png
 }
 
+call_key() {  # call_key: ask the app the window's key state, retrying a busy app like the loop does.
+              # The answer is in the result word: word=1 is key. Prints the last result and tries.
+    local out i
+    for i (1 2 3 4 5 6 7 8); do
+        out=$($probe run $host $maxwid key)
+        [[ "$out" == result=ok* ]] && { print -r -- "$out attempts=$i"; return 0; }
+        sleep 0.5
+    done
+    print -r -- "$out attempts=$i"
+    return 1
+}
+
 start_host ""
 out=$(call_engine applied)
 case "$out" in
@@ -104,6 +116,106 @@ kill -0 $host 2>/dev/null && note "PASS app with a 1 ms timer survives the calls
 px=$(squared $maxwid)
 [[ "$px" == square=0* ]] && note "PASS timer app ends unharmed and unchanged: $px" \
                          || note "FAIL timer app left changed: $px"
+stop_host
+
+# The crash of 2026-10-20, kept as a standing check: the shipped app crashed iTerm four times in
+# an hour, all on thread 0 (CF run-loop port trap, CF timer heap with a return address in
+# anonymous memory, pc in no image at all) while apply storms entered its main thread seconds
+# before each crash. The old entry checked the parked state and then acted on it, a window the
+# app could wake into (Task 7's race, left open). The entry now stops the thread first, so the
+# check and the entry share one frozen moment. This hammers 100 entries into an app woken every
+# millisecond: every one has to run, and the app has to be alive and parkable afterwards.
+start_host "tick"
+ok=0
+for _ (1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 \
+       21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 \
+       41 42 43 44 45 46 47 48 49 50); do
+    [[ "$(call_engine applied)" == result=ok* ]] && ok=$((ok+1))
+    [[ "$(call_engine restored)" == result=ok* ]] && ok=$((ok+1))
+done
+(( ok == 100 )) && note "PASS race stress: 100/100 entries into a 1 ms-timer app" \
+                || note "FAIL race stress: $ok/100 entries ran"
+sleep 1
+kill -0 $host 2>/dev/null && note "PASS app survives the race stress" \
+                           || note "FAIL app died in the race stress"
+[[ "$($probe park $host)" == "park $host parked" ]] && note "PASS race-stress app parks afterwards" \
+                                                    || note "FAIL race-stress app does not park afterwards"
+stop_host
+
+# The poison (plan 2026-10-20): apply/restore entries at production storm rates against
+# WindowServer-churning windows with a focus flap — the repro harness for the CF
+# __CFRunLoopServiceMachPort.cold.1 trap class. It must stay green: every entry runs, the
+# apps live and park, and no fresh cold.1 crash report appears. tests/poison.sh exits 3 for
+# "no trap" (the passing answer), 0 when the trap fires, 1 when an app died without one.
+out=$(POISON_CALLS=40 POISON_APPS=2 POISON_WINDOWS=2 POISON_BUTTONS=1 POISON_ARGS=churn \
+      POISON_RETRY=0 tests/poison.sh 1)
+rc=$?
+case "$rc" in
+    3) note "PASS poison: storm entries with churn and focus flap, no CF cold.1 trap: $out" ;;
+    0) note "FAIL poison: CF cold.1 trap reproduced: $out" ;;
+    *) note "FAIL poison (exit $rc): $out" ;;
+esac
+
+# The focus undo, measured 2026-10-20: a window becoming key re-enables AppKit's top-edge
+# highlight on a window we changed (the change's ~16 rows move back), while an untouched
+# window's focus redraw moves nothing — and the in-app properties (hasShadow,
+# drawsDecorationView) stay as the apply left them, so they are not the signal. The signal is
+# the window's own key state: `probe run <pid> <wid> key` asks the app `isKeyWindow` for a
+# whole batch in one call and packs the answers into the result word (word=1 is key). Measured
+# 2026-10-20: the read is the reliable half — a headless activation makes the window key
+# (word=1) while the rim pixels stay unflipped; AppKit's rim redraw wants a user gesture. So
+# the read is asserted and the rim reported; the loop's response to the signal is unit-tested
+# (WindowTrackerTests, ScanLoopTests).
+start_host ""
+out=$(call_engine applied)
+case "$out" in
+    result=ok*) note "PASS focus-undo: applied: $out" ;;
+    *) note "FAIL focus-undo: applied: $out"
+        stop_host
+        exit $fail ;;
+esac
+px=$(squared $maxwid)
+cp build/engine.png build/fu_applied.png
+[[ "$px" == "square=1 rim=0" ]] && note "PASS focus-undo: the rim is gone: $px" || note "FAIL after apply: $px"
+kill -CONT $host; sleep 0.9                              # focus in: AppKit puts its highlight back
+out=$(call_key)
+# The key answer is the gate: it is what the loop reads, and it answers headless.
+# Measured 2026-10-20: the handler's activation after launch makes the window key (word=1)
+# with the terminal frontmost; if activation is refused outright, word=0 and the signal has
+# no subject to assert on — the SKIP below says so honestly.
+if [[ "$out" == *word=1* ]]; then
+    note "PASS focus-in made the window key; that is the loop's signal: $out"
+    px=$(squared $maxwid)
+    if [[ "$px" == *rim=1* ]]; then
+        note "PASS the key window's rim is back; the signal tracks the visible undo: $px"
+    else
+        note "SKIP rim pixels: key without a user gesture does not redraw AppKit's rim: $px"
+    fi
+    out=$(call_engine applied)
+    [[ "$out" == result=ok* ]] && note "PASS the change goes back on: $out" || note "FAIL re-apply: $out"
+    px=$(squared $maxwid)
+    [[ "$px" == *rim=0* ]] && note "PASS the rim is gone again: $px" || note "FAIL after re-apply: $px"
+    kill -WINCH $host; sleep 0.7
+    out=$(call_key)
+    [[ "$out" == *word=0* ]] && note "PASS focus-out answers not key; the budget is finite: $out" \
+                             || note "FAIL after focus-out: $out"
+    kill -CONT $host; sleep 0.9                          # the next focus cycle undoes it again: the budget's reason
+    out=$(call_key)
+    if [[ "$out" == *word=1* ]]; then
+        note "PASS the next focus cycle reads key again: $out"
+        px=$(squared $maxwid)
+        if [[ "$px" == *rim=1* ]]; then
+            note "PASS the next focus cycle undoes it again: $px"
+        else
+            note "SKIP rim pixels: key without a user gesture does not redraw AppKit's rim: $px"
+        fi
+    else
+        note "SKIP 2nd focus cycle: key transfer back to a background app is refused headless: $out"
+    fi
+else
+    note "SKIP focus-undo: focus-in did not make the window key (no user gesture; key transfer is prevented): $out"
+fi
+call_engine restored > /dev/null
 stop_host
 
 # Review Focus: an app whose main thread never parks must not be touched at all.

@@ -106,9 +106,9 @@ restart those apps, or reopen their windows, once.
 
 ## How it works
 
-NoBorder.app is the whole product: no daemon, no debugger, no child process. The app looks at the
-window list, decides which windows to change, and makes the changes **inside the app that owns the
-window**, in that app's own main thread.
+NoBorder.app is the whole product: no daemon, no child process. The app looks at the window list,
+decides which windows to change, and makes the changes **inside the app that owns the window**, in
+that app's own main thread — through a small agent it installs there once.
 
 - **Which windows:** every 250 ms the app lists the on-screen windows of layer 0 and compares each
   frame with every screen's `NSScreen.visibleFrame`, within 2 pt. A window has to stay in that state
@@ -119,59 +119,57 @@ window**, in that app's own main thread.
   `drawsDecorationView = NO` on the titlebar container removes the rim. Passing `YES` / `0` / `YES`
   puts each back. All three are ordinary AppKit calls, run where AppKit expects to be run: the app's
   main thread.
-- **How the thread is persuaded:** the app opens the target's task port (`task_for_pid`, which is why
-  SIP must be off), finds its main thread, and reads its registers. It only goes on when that thread
-  is *parked* in its run loop — asleep in the kernel inside the run-loop's Mach call, with
-  `__CFRunLoopServiceMachPort` in the frames above it. It writes generated arm64 code and its data
-  into the target, along with a private stack, ends the kernel call the thread is parked in so the
-  kernel returns it to user space at the code, and the code makes the calls, writes a completion
-  flag, restores the app's own registers and jumps back to the **start** of the run-loop wait it was
-  in. The app re-issues its own call and is never left in the middle of one. Nothing is read from the
-  thread; the answer is read from memory.
-- **Nothing runs in a busy app.** If the main thread is not parked, the window is left exactly as it
-  is and asked about again on a later scan, with no cap on the deferral. A call that faults is caught
-  by the exception handler NoBorder installs for the duration of that run: the thread's saved state is
-  restored, the app never sees the fault, and the log says `engine failed`.
+- **The resident agent.** The first time NoBorder needs to change a window of an app, it opens that
+  app's task port (`task_for_pid`, which is why SIP must be off) and installs a small agent into it
+  once: a message port on the app's own run loop. From then on, every change is a short message to
+  that agent, which makes the AppKit calls on the app's main thread when the run loop next services
+  it — no per-change thread entry, no debugger pause. The install happens only while the app's main
+  thread is parked in its run loop; a faulting install is caught by an exception guard, so the app
+  survives it untouched.
+- **Focus changes.** When you switch apps, the app that regains focus repaints its own decorations
+  over NoBorder's change. NoBorder hears the focus change in-process (`NSWorkspace`) and re-sends the
+  change at once, so the border comes back off in milliseconds. Because the agent runs out of
+  process, there can be a brief flash before the re-apply lands — AppKit draws the border in the
+  focus-change frame, and the re-apply is the next one.
+- **Busy apps.** The agent install needs the app's main thread parked; if the app is busy, the
+  install is deferred and tried again on a later scan, with no cap on the deferral — the window is
+  never damaged, only left as it is until the app is quiet. Once the agent is installed, changes are
+  just messages and do not wait on the app being idle.
+- **Quit / off.** Turning NoBorder off, quitting, or the app being terminated puts every window it
+  changed back and removes the agents it installed.
 - **Signing:** the app is signed with `com.apple.security.cs.debugger`, which is what lets it use
   `task_for_pid`. That, plus SIP being off, is the whole privilege it needs.
 
 ### Costs and limits
 
-- A window is changed when its app's main thread is next idle, and the change is a short sequence of
-  AppKit calls, not a debugger pause. It is not something you feel.
-- The honest numbers: entering the app and handing its thread back costs its main loop about 4 ms
-  (measured against a no-engine baseline of the same shape). The AppKit calls themselves keep that
-  app's main loop busy for hundreds of milliseconds on a full-screen window — gaps of up to 290 ms
-  were measured on a test app. v1.1 did the same work and paid for it with a ~3.5 s debugger stop,
-  which is the number this release removes.
-- NoBorder runs nothing inside an app that is busy, so a window of a busy app changes when that app
-  next parks. It is asked about again for as long as it stays in the state that needs the change.
-- There is no launch grace: a newly launched app's maximized window can change within a second. The
-  park check is the guard, not a waiting period.
-- If an app puts its own outline back, NoBorder cannot see that: the shadow state lives in the app,
-  and there is no WindowServer tag to read. Reopening the window, moving it, or toggling NoBorder
-  applies it again.
-- Quitting, turning NoBorder off, and the app being terminated all ask every app to put its windows
-  back. A `kill -9` leaves them changed, and a later NoBorder does not know about them: reopen those
-  windows once.
-- Only AppKit windows change corners, including Chromium and Electron apps. Others keep them.
-- Uses private AppKit and SkyLight APIs. If a macOS update removes one, that step is skipped and the
-  app is not touched — a window can end up with square corners and a rim, never with a crashed app.
+- A change is a message to the agent already resident in the app — ~a millisecond, not a debugger
+  pause. Installing the agent is a one-time cost per app, taken while that app's main thread is idle.
+- Idle, NoBorder is a 250 ms window-list scan plus an occasional, throttled check of the windows it
+  has changed; it is not something you feel.
+- If an app repaints its border on a focus change, NoBorder re-applies on that same focus event; a
+  brief flash before the re-apply lands is possible (the agent cannot draw in the app's own frame).
+- Quitting, turning NoBorder off, and the app being terminated all put the changed windows back and
+  remove the agents. A `kill -9` of NoBorder leaves them changed, and a later NoBorder does not know
+  about them: reopen those windows once.
+- Only AppKit windows change, including Chromium and Electron apps. Others keep their border.
+- Hot, always-busy apps may keep deferring the agent install; the window is deferred, never damaged.
+- Uses private AppKit APIs. If a macOS update removes one, that step is skipped and the app is not
+  touched — a window can end up with square corners and a rim, never with a crashed app.
 
 ## Development
 
 ```sh
-make test                           # Swift unit tests, the probe checks, the engine checks
-make testtools && tests/e2e.sh      # end-to-end: the engine driven by the probe
+make test                           # Swift unit tests + the probe, engine, agent, blob-agent and focus checks
+make testtools && tests/e2e.sh      # end-to-end against a test app: the engine driven by the probe
 make testtools && NOBORDER_E2E=app tests/e2e.sh         # the built app (touches your windows; quit NoBorder first)
-make bench                          # how long the engine stops a test app's main loop
 make release                        # build/NoBorder.zip for a GitHub release
 ```
 
 | Path | What it is |
 |---|---|
 | `app/Sources/NoBorderLogic` | the scanner, the tracker, the 250 ms scan loop |
-| `app/Sources/NoBorderEngine` | task port, park check, generated arm64 call script, fault guard |
+| `app/Sources/NoBorderEngine` | the `ChangeEngine` protocol the scan loop talks to |
+| `app/Sources/NoBorderNative` | task port, agent install/removal, the generated arm64 agent, fault guard |
 | `app/Sources/NoBorder` | the menu bar app |
-| `tests/` | unit tests, the test app, the end-to-end, probe, engine and benchmark scripts |
+| `tests/` | unit tests, the test app, the end-to-end, probe, engine, agent and focus scripts |
 | `docs/` | website (GitHub Pages) |

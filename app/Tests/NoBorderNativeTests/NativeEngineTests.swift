@@ -1,6 +1,6 @@
 import Darwin
 import XCTest
-@testable import NoBorderEngine
+@testable import NoBorderNative
 
 /// The engine's decisions, with a fake runner in place of the Mach side: which call script a batch
 /// of windows turns into, what is logged for each outcome, and what is refused. Running the script
@@ -168,5 +168,50 @@ final class NativeEngineTests: XCTestCase {
         // Every refusal is reported: the engine has no policy of its own about how often to say it,
         // and deduplicating a permanent one in the app's log is the scan loop's job (Task 10).
         XCTAssertEqual(logs, ["skipped (not AppKit) 42 3", "skipped (not AppKit) 42 4"])
+    }
+
+    // MARK: the key state read
+
+    func testKeyWindowsRunsOneReadScriptForTheWholeBatch() {
+        runner.outcome = CallOutcome(result: .ok, word: 0b11)
+        XCTAssertEqual(engine.keyWindows(pid: 42, windows: [3, 5]), [3: true, 5: true], "the word says both are key")
+        XCTAssertEqual(runner.calls, [FakeRunner.Call(pid: 42, script: .keyStateRead(windowNumbers: [3, 5]))])
+        XCTAssertEqual(runner.probes, [42], "the AppKit gate is the same gate an apply passes")
+    }
+
+    func testTheAnswerWordAnswersEveryWindowOfTheBatch() {
+        // One bit per window, the first window above the last: [3, 5] puts 3 at bit 1 and 5 at bit 0.
+        // The tracker decides with transitions, so a read that ran answers not-key windows too.
+        runner.outcome = CallOutcome(result: .ok, word: 0b10)
+        XCTAssertEqual(engine.keyWindows(pid: 42, windows: [3, 5]), [3: true, 5: false])
+        runner.outcome = CallOutcome(result: .ok, word: 0b01)
+        XCTAssertEqual(engine.keyWindows(pid: 42, windows: [3, 5]), [3: false, 5: true])
+        runner.outcome = CallOutcome(result: .ok, word: 0)
+        XCTAssertEqual(engine.keyWindows(pid: 42, windows: [3, 5]), [3: false, 5: false], "none key, both answered")
+    }
+
+    func testAKeyReadThatDidNotRunAnswersNothing() {
+        runner.outcome = CallOutcome(result: .notParked, word: nil)
+        XCTAssertEqual(engine.keyWindows(pid: 42, windows: [3, 5]), [:], "a read that did not run knows nothing")
+        XCTAssertEqual(logs, ["skipped (not parked) 42 3 5"])
+    }
+
+    func testAKeyReadOnATargetWithoutAppKitIsRefusedAndTouchesNothing() {
+        runner.appKitWord = 0
+        XCTAssertEqual(engine.keyWindows(pid: 42, windows: [3]), [:])
+        XCTAssertEqual(logs, ["skipped (not AppKit) 42 3"])
+        XCTAssertEqual(runner.calls, [])
+    }
+
+    func testASuccessfulKeyReadSaysNothing() {
+        runner.outcome = CallOutcome(result: .ok, word: 0b1)
+        XCTAssertEqual(engine.keyWindows(pid: 42, windows: [3]), [3: true])
+        XCTAssertEqual(logs, [], "a read that answers is not news four times a second")
+    }
+
+    func testAKeyReadWithNoResultWordIsTheEnginesOwnFailure() {
+        runner.outcome = CallOutcome(result: .ok, word: nil)
+        XCTAssertEqual(engine.keyWindows(pid: 42, windows: [3]), [:])
+        XCTAssertEqual(logs, ["engine failed 42 3: no result word"])
     }
 }

@@ -29,9 +29,11 @@ final class AssemblerCheck {
         let path = dir.appendingPathComponent("\(name).s")
         try (".text\n" + source + "\n").write(to: path, atomically: true, encoding: .utf8)
         let object = dir.appendingPathComponent("\(name).o")
-        _ = run("/usr/bin/xcrun", ["clang", "-c", "-arch", "arm64", "-o", object.path, path.path])
+        try? FileManager.default.removeItem(atPath: object.path)   // a stale .o masks a failed clang
+        let clang = run("/usr/bin/xcrun", ["clang", "-c", "-arch", "arm64", "-o", object.path, path.path],
+                        captureStderr: true)
         guard FileManager.default.fileExists(atPath: object.path) else {
-            throw Failed(reason: "assembling \(name).s failed")
+            throw Failed(reason: "assembling \(name).s failed: \(clang ?? "no output")\nsource: \(source)")
         }
         guard let dump = run("/usr/bin/xcrun", ["otool", "-X", "-s", "__TEXT", "__text", object.path]) else {
             throw Failed(reason: "could not read __text of \(name).o")
@@ -42,15 +44,21 @@ final class AssemblerCheck {
     }
 
     @discardableResult
-    private func run(_ launch: String, _ arguments: [String]) -> String? {
+    private func run(_ launch: String, _ arguments: [String], captureStderr: Bool = false) -> String? {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: launch)
         process.arguments = arguments
         let pipe = Pipe()
         process.standardOutput = pipe
-        process.standardError = Pipe()
+        let errPipe = Pipe()
+        process.standardError = captureStderr ? errPipe : Pipe()
         do { try process.run() } catch { return nil }
         process.waitUntilExit()
-        return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
+        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        if captureStderr {
+            let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            return out + err
+        }
+        return out
     }
 }

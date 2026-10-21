@@ -15,12 +15,19 @@ app: build/AppIcon.icns
 	cp build/AppIcon.icns $(APP)/Contents/Resources/
 	codesign --force --sign - --entitlements app/Entitlements.plist $(APP)
 
-# Development binary for driving the native engine by hand (tests/probe.sh drives it).
+# Development binaries, driven by the shell tests: noborder-probe (the native engine by hand,
+# tests/probe.sh), noborder-tool (the agent rendezvous client, tests/agent.sh, blobagent.sh,
+# blobops.sh), noborder-e2e (the whole app stack scoped to one window, tests/focus.sh). All need
+# the debugger entitlement to open a task port.
 probe:
 	cd app && swift build
 	mkdir -p build
 	cp app/.build/debug/noborder-probe build/noborder-probe
-	codesign --force --sign - --entitlements app/Entitlements.plist build/noborder-probe
+	codesign --force --sign - --entitlements app/Entitlements.probe.plist build/noborder-probe
+	cp app/.build/debug/noborder-tool build/noborder-tool
+	codesign --force --sign - --entitlements app/Entitlements.probe.plist build/noborder-tool
+	cp app/.build/debug/noborder-e2e build/noborder-e2e
+	codesign --force --sign - --entitlements app/Entitlements.probe.plist build/noborder-e2e
 
 release: app
 	rm -f build/NoBorder.zip
@@ -35,6 +42,9 @@ test:
 	$(MAKE) testtools probe
 	tests/probe.sh
 	tests/engine.sh
+	tests/agent.sh
+	tests/blobagent.sh
+	tests/focus.sh
 
 testtools: tests/hostapp tests/winpixels tests/pxband tests/wbounds tests/plainrunloop
 

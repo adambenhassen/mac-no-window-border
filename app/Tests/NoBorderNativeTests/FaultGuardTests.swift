@@ -1,6 +1,6 @@
 import Darwin
 import XCTest
-@testable import NoBorderEngine
+@testable import NoBorderNative
 
 /// The fault guard's two pieces of pure logic: reading a real `exception_raise` request, and
 /// building the reply that answers it. What cannot be tested here is the Mach round trip itself —

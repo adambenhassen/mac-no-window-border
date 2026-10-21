@@ -1,7 +1,7 @@
 import Foundation
-import NoBorderEngine
+import NoBorderNative
 
-let usage = "usage: noborder-probe taskport|mainthread|park|threadinfo|runstate <pid> | run <pid> <wid> applied|restored|buttons-hidden [fault] | apply|restore <pid> <wid>…"
+let usage = "usage: noborder-probe taskport|mainthread|park|threadinfo|runstate <pid> | run <pid> <wid> applied|restored|buttons-hidden|key|noop [fault] | run-repeat <pid> <wid> <mode> <count> | apply|restore <pid> <wid>… | agent-ping <pid> <port-name> | agent-install <pid> | agent-install-fault <pid> | agent-dump <pid> <hex-base> | agent-portinfo <pid> <hex-name> | agent-code <pid> <hex-base> <words> (rendezvous: noborder-tool <pid> [count])"
 let args = CommandLine.arguments
 guard args.count >= 3, let pid = Int32(args[2]) else {
     print(usage)
@@ -30,6 +30,21 @@ func describe(_ result: RunResult) -> String {
     }
 }
 
+func probeScript(mode: String, wid: UInt32, fault: Bool) -> RemoteScript? {
+    var script: RemoteScript
+    switch mode {
+    case "applied": script = RemoteScript.applied(windowNumbers: [wid])
+    case "restored": script = RemoteScript.restored(windowNumbers: [wid])
+    case "buttons-hidden": script = RemoteScript.applied(windowNumbers: [wid], buttonsHidden: true)
+    case "key": script = RemoteScript.keyStateRead(windowNumbers: [wid])
+    case "noop": script = RemoteScript.appKitProbe()
+    default: return nil
+    }
+    script.forceFaultForTesting = fault
+    return script
+}
+
+
 let task: TargetTask
 do {
     task = try TargetTask(pid: pid)
@@ -41,6 +56,15 @@ do {
     fail("\(args[1]) \(pid) error: \(error)")
 }
 
+// The rendezvous client is noborder-tool, not this binary. Byte-identical 0x13 sends
+// (MACH_MSGH_BITS(COPY_SEND, PORT_NONE)) answer kr 0 from the tool and
+// MACH_SEND_INVALID_DEST 0x10000010 from the probe, deterministically, with identical
+// messages and port state — an OBSERVED binary-shape-dependent discrepancy, kernel
+// mechanism uncharacterized (full measured family matrix in
+// .superpowers/sdd/2026-10-20-noborder-dispatch-entry/progress.md; thread/
+// task_swap_mach_voucher are KERN_NOT_SUPPORTED stubs on macOS 15, so no voucher
+// manipulation explains it). The install verbs here install, inspect, and report; the
+// rendezvous runs in tests via build/noborder-tool.
 switch args[1] {
 case "taskport":
     print("taskport \(pid) ok")
@@ -78,21 +102,35 @@ case "runstate":
 case "run":
     guard args.count >= 5, args.count <= 6, let wid = UInt32(args[3]) else { print(usage); exit(2) }
     if args.count == 6, args[5] != "fault" { print(usage); exit(2) }
-    var script: RemoteScript
-    switch args[4] {
-    case "applied": script = RemoteScript.applied(windowNumbers: [wid])
-    case "restored": script = RemoteScript.restored(windowNumbers: [wid])
-    case "buttons-hidden": script = RemoteScript.applied(windowNumbers: [wid], buttonsHidden: true)
-    default: print(usage); exit(2)
-    }
-    script.forceFaultForTesting = args.count == 6
+    guard let script = probeScript(mode: args[4], wid: wid, fault: args.count == 6) else { print(usage); exit(2) }
     guard let addresses = AddressTable.current() else { fail("run \(pid) no-addresses") }
     guard let main = task.mainThread() else { fail("run \(pid) no-main-thread") }
-    let (result, stopNanoseconds) = RemoteExecutor(task: task).run(script, on: main, addresses: addresses)
+    let executor = RemoteExecutor(task: task)
+    let (result, stopNanoseconds) = executor.run(script, on: main, addresses: addresses)
     var line = "result=\(describe(result)) stop_us=\(stopNanoseconds / 1000)"
     if case .failed(let reason) = result { line += " reason=\(reason)" }
+    // The answer word is only trustworthy once the run completed: before the flag it says nothing.
+    if script.keyStateRead, result == .ok, let word = executor.lastResultWord { line += " word=\(word)" }
+    if let absorbKr = executor.lastAbsorbKr { line += " absorb_kr=0x\(String(absorbKr, radix: 16))" }
     print(line)
     exit(result == .ok ? 0 : 1)
+case "run-repeat":
+    // Tests only: repeated entries on ONE executor, in one process — the quarantine's domain,
+    // which a per-process executor (each probe run) can never show. With NOBORDER_NOQUEUE=1 the
+    // first entry runs out its stop limit and quarantines the target for this executor's life:
+    // every later entry must answer not-parked immediately, with the target untouched.
+    guard args.count >= 6, let wid = UInt32(args[3]), let count = Int(args[5]), count > 0, count <= 2000 else { print(usage); exit(2) }
+    guard let script = probeScript(mode: args[4], wid: wid, fault: false) else { print(usage); exit(2) }
+    guard let addresses = AddressTable.current() else { fail("run-repeat \(pid) no-addresses") }
+    guard let main = task.mainThread() else { fail("run-repeat \(pid) no-main-thread") }
+    let executor = RemoteExecutor(task: task)
+    var first: RunResult = .notParked
+    for n in 1...count {
+        let (result, stopNanoseconds) = executor.run(script, on: main, addresses: addresses)
+        print("run-repeat \(pid) n=\(n) result=\(describe(result)) stop_us=\(stopNanoseconds / 1000)")
+        if n == 1 { first = result }
+    }
+    exit(first == .timedOut ? 0 : 1)
 case "apply", "restore":
     // The engine, one batch of windows in one process. What it decided is on stdout as log lines;
     // the exit code says whether the batch was applied, which is all a caller outside the test needs.
@@ -104,7 +142,111 @@ case "apply", "restore":
     if args[1] == "apply" { engine.apply(pid: pid, windows: numbers, buttonsHidden: false) } else { engine.restore(pid: pid, windows: numbers) }
     engine.shutdown()
     exit(lines.contains { $0.hasPrefix(verb) } ? 0 : 1)
+case "agent-engine":
+    // The app's engine class (AgentEngine) driven directly: apply/restore for the given
+    // windows; prints the per-window answer. The integration gate for the blob transport.
+    guard args.count > 3 else { fail("agent-engine <pid> <wid>… apply|restore [buttons]") }
+    let verb = args.last == "buttons" ? args[args.count - 2] : args.last!
+    guard ["apply", "restore"].contains(verb) else { fail("agent-engine <pid> <wid>… apply|restore [buttons]") }
+    let numbers = args.dropFirst(2).dropLast(verb == "buttons" ? 2 : 1).compactMap { UInt32($0) }
+    let buttons = args.last == "buttons"
+    let engine = AgentEngine()
+    if verb == "apply" {
+        for wid in numbers {
+            let again = engine.apply(pid: pid, windows: [wid], buttonsHidden: buttons)
+            print("agent-engine \(pid) wid=\(wid) apply " + (again.isEmpty ? "changed" : "again"))
+        }
+    } else {
+        for wid in numbers {
+            let again = engine.restore(pid: pid, windows: [wid])
+            print("agent-engine \(pid) wid=\(wid) restore " + (again.isEmpty ? "changed" : "again"))
+        }
+    }
+    engine.shutdown()
+case "agent-install":
+    // P1a blob install: the installer writes the two pages (code RX, state RW) and runs the
+    // entry as a dispatched block under the fault guard; the pages stay mapped, owned by no
+    // one, for the host's lifetime. entryDone is the block's flag (the entry returned);
+    // ready is the blob's publication slot — the two are deliberately separate facts.
+    // The gate here is the install; the rendezvous is noborder-tool's job.
+    let install = AgentInstaller(task: task).install(pid: UInt64(pid), forceFault: false)
+    if let reason = install.failure { fail("agent-install \(pid) refused: \(reason)") }
+    if let report = install.report {
+        print("agent-install \(pid) result=\(describe(report.result)) entryDone=\(report.entryDone) "
+              + "ready=\(report.ready.map(String.init) ?? "nil") err=\(report.err.map(String.init) ?? "nil") "
+              + "base=0x" + String(report.base, radix: 16) + " serviceName=\(report.serviceName) "
+              + "stop_us=\(report.stopNanoseconds / 1000)")
+        exit(report.ready == 1 ? 0 : 1)
+    }
+case "agent-install-fault":
+    // The fault-absorb gate: the entry's first act is a jump to address 1. The fault guard
+    // must catch it, `ready` must stay 0, and the host must keep running (the test proves
+    // that by pinging its windows afterwards).
+    let installFault = AgentInstaller(task: task).install(pid: UInt64(pid), forceFault: true)
+    if let reason = installFault.failure { fail("agent-install-fault \(pid) refused: \(reason)") }
+    if let report = installFault.report {
+        print("agent-install-fault \(pid) result=\(describe(report.result)) entryDone=\(report.entryDone) "
+              + "ready=\(report.ready.map(String.init) ?? "nil") err=\(report.err.map(String.init) ?? "nil") "
+              + "base=\(describe(address: report.base))")
+        guard report.result == .faulted, report.ready == 0 else { exit(1) }
+        exit(0)
+    }
+case "agent-uninstall":
+    // P1d removal: the dispatched block invalidates the agent's port and releases the
+    // source, then the pages are deallocated (nothing can execute on them after that).
+    guard args.count > 3, let base = UInt64(args[3], radix: 16) else { fail("agent-uninstall \(pid) wants a hex base") }
+    let removal = AgentInstaller(task: task).remove(pid: UInt64(pid), base: base)
+    print("agent-uninstall \(pid) result=\(describe(removal.result)) stop_us=\(removal.stopNanoseconds / 1000)"
+          + (removal.failure.map { " failure=\($0)" } ?? ""))
+    exit(removal.failure == nil ? 0 : 1)
+case "agent-dump":
+    // Debug: read the installed blob's state slots back (needs the base from agent-install).
+    guard args.count > 3, let base = UInt64(args[3], radix: 16) else { fail("agent-dump \(pid) wants a hex base") }
+    let dump = AgentInstaller(task: task).dumpState(base: base)
+    print("agent-dump \(pid) base=0x" + String(base, radix: 16) + " "
+          + dump.map { "\($0.0)=" + ($0.1.map { "0x" + String($0, radix: 16) } ?? "nil") }
+                .joined(separator: " "))
+case "agent-rows":
+    // Debug: the op table's rows (generations, flags, captured originals).
+    guard args.count > 3, let base = UInt64(args[3], radix: 16) else { fail("agent-rows \(pid) wants a hex base") }
+    for line in AgentInstaller(task: task).dumpRows(base: base) { print(line) }
+case "agent-portinfo":
+    // Debug: the kernel's view of an installed blob's CFMachPort name (a target-space name, from
+    // agent-dump's agentPort): msgcount = queue depth, srights/sorights/mscount, pdrequest.
+    guard args.count > 3, let name = UInt32(args[3], radix: 16) else { fail("agent-portinfo \(pid) wants a hex name") }
+    typealias GAFn = @convention(c) (mach_port_name_t, mach_port_name_t, mach_port_flavor_t, UnsafeMutableRawPointer, UnsafeMutablePointer<mach_msg_type_number_t>) -> Int32
+    guard let gaSym = dlsym(dlopen(nil, RTLD_LAZY), "mach_port_get_attributes") else { fail("agent-portinfo \(pid) no mach_port_get_attributes") }
+    let ga = unsafeBitCast(gaSym, to: GAFn.self)
+    var pbuf = [UInt32](repeating: 0, count: 10)
+    var pcnt = mach_msg_type_number_t(10)
+    let pkr = pbuf.withUnsafeMutableBytes { b in ga(task.port, name, mach_port_flavor_t(MACH_PORT_RECEIVE_STATUS), b.baseAddress!, &pcnt) }
+    print("agent-portinfo \(pid) name=0x" + String(name, radix: 16) + " kr=\(pkr) "
+          + "seqno=\(pbuf[1]) mscount=\(pbuf[2]) qlimit=\(pbuf[3]) msgcount=\(pbuf[4]) "
+          + "sorights=\(pbuf[5]) srights=\(pbuf[6]) pdrequest=\(pbuf[7]) nsrequest=\(pbuf[8]) "
+          + "flags=0x" + String(pbuf[9], radix: 16))
+case "agent-code":
+    // Debug: read the installed blob's code words back (hex, word indexes from the code page).
+    guard args.count > 4, let base = UInt64(args[3], radix: 16), let count = Int(args[4]) else {
+        fail("agent-code \(pid) wants a hex base and a word count")
+    }
+    let code = AgentInstaller(task: task).dumpCode(base: base, words: count)
+    print("agent-code \(pid) " + code.enumerated().map { i, w in
+        "\(i):" + (w.map { String(format: "%08x", $0) } ?? "nil")
+    }.joined(separator: " "))
+case "agent-addrs":
+    // Debug: the two tables the installer feeds the blob — the executor's stub addresses and
+    // the blob's own dlsym'd set, as THIS process resolves them.
+    guard let exec = AddressTable.current(), let agent = AgentAddresses.current() else { fail("agent-addrs \(pid) no-addresses") }
+    print("exec: " + Mirror(reflecting: exec).children.map { "\($0.label ?? "?")=" + String(format: "%016x", $0.value as! UInt64) }.joined(separator: " "))
+    print("agent: " + agent.table.map { String(format: "%016x", $0) }.joined(separator: " "))
+case "agent-ping":
+    // P1a-0 (kept for the record): the extract-right handoff is DEAD on macOS 15 —
+    // mach_port_extract_right on a target-allocated name returns KERN_INVALID_CAPITAL (18),
+    // measured 2026-10-20, so this path cannot get a send right and never pings.
+    // tests/agent.sh drives the live shape: noborder-tool.
+    fail("agent-ping \(pid) extract-right is dead on this OS (kr 18); use noborder-tool")
 default:
     print(usage)
     exit(2)
 }
+

@@ -27,6 +27,17 @@ final class FaultGuard {
     static let masks: exception_mask_t = [EXC_MASK_BAD_ACCESS, EXC_MASK_BAD_INSTRUCTION, EXC_MASK_GUARD]
         .reduce(0) { $0 | exception_mask_t($1) }
 
+    /// What this guard instance is installed for.
+    private(set) var installedMasks: exception_mask_t = 0
+
+    /// Tests only: `NOBORDER_GUARD_BREAKPOINT=1` adds `EXC_BREAKPOINT` — the CF run-loop port trap
+    /// is a breakpoint, and ReportCrash stops writing reports after the first of a run, so the
+    /// probe's `watch` mode catches the state the app dies in (`drainAndLog`).
+    static var diagnosticMasks: exception_mask_t {
+        ProcessInfo.processInfo.environment["NOBORDER_GUARD_BREAKPOINT"] == "1"
+            ? masks | exception_mask_t(EXC_MASK_BREAKPOINT) : masks
+    }
+
     /// `exception_raise` in the routine table at the end of `<mach/exc.h>`.
     static let exceptionRaiseID: mach_msg_id_t = 2401
 
@@ -54,19 +65,92 @@ final class FaultGuard {
     deinit { remove() }
 
     /// Install our port as the target's handler. Nothing is changed in the target if this fails.
-    func install() -> Bool {
+    @discardableResult
+    func install(masks: exception_mask_t = FaultGuard.masks) -> Bool {
         precondition(receive == 0, "the fault guard is already installed")
         guard mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &receive) == KERN_SUCCESS
         else { return false }
         guard mach_port_insert_right(mach_task_self_, receive, receive,
                                      mach_msg_type_name_t(MACH_MSG_TYPE_MAKE_SEND)) == KERN_SUCCESS
         else { return false }
-        guard readAppHandlers() else { remove(); return false }
-        let kr = task_set_exception_ports(task.port, Self.masks, receive,
+        guard readAppHandlers(masks) else { remove(); return false }
+        let kr = task_set_exception_ports(task.port, masks, receive,
                                           EXCEPTION_DEFAULT, thread_state_flavor_t(ARM_THREAD_STATE64))
         guard kr == KERN_SUCCESS else { remove(); return false }
-        taken = Self.masks
+        taken = masks
+        installedMasks = masks
         return true
+    }
+
+    /// Watch mode (tests): take the next exception, print the dying thread's state, and answer
+    /// KERN_FAILURE so the app dies as it would anyway. The point is the state: pc, the trap's
+    /// codes, and every register — `__CFRunLoopServiceMachPort`'s dying frame carries the
+    /// `mach_msg2` arguments (x0 = message, x1 = options, x2 = send size, x3 = receive size,
+    /// x4 = receive name, x5 = timeout, x6 = overmach) and its kr; the message header at x0 is
+    /// read through the task (`msgh_bits`, `msgh_size`, `msgh_id`, reserved) to see which
+    /// argument the kernel rejected (`MACH_RCV_INVALID_ARGUMENTS` = 0x10004013, measured
+    /// 2026-10-20; the kr is not an interrupt echo).
+    func drainAndLog() -> Bool {
+        guard let fault = receiveFault() else { return false }
+        let thread = MainThread(port: fault.thread, id: kernelThreadID(of: fault.thread) ?? 0)
+        if let state = thread.state() {
+            var line = "noborder watch: exception=\(fault.exception) codes=\(fault.codes.map { String(format: "0x%x", $0) })"
+                + " pc=0x\(String(state.__pc, radix: 16)) lr=0x\(String(state.__lr, radix: 16))"
+                + " sp=0x\(String(state.__sp, radix: 16))"
+            withUnsafeBytes(of: state.__x) { raw in
+                for index in 0...28 {
+                    line += " x\(index)=0x\(String(raw.load(fromByteOffset: index * 8, as: UInt64.self), radix: 16))"
+                }
+            }
+            // The mach_msg2 arguments, per the arm64 call-convention of the run-loop-port call.
+            for (name, register) in [("msg", 0), ("options", 1), ("sendsize", 2), ("rcvsize", 3),
+                                     ("rcvname", 4), ("timeout", 5), ("overmach", 6)] {
+                let value: UInt64 = withUnsafeBytes(of: state.__x) { raw in
+                    raw.load(fromByteOffset: register * 8, as: UInt64.self)
+                }
+                line += " \(name)=0x\(String(value, radix: 16))"
+            }
+            NSLog(line)
+            // In `__CFRunLoopServiceMachPort` (this OS): x25 = the message buffer, [sp, #8] = the
+            // result-pointer argument; the call is `mach_msg(x25, w27 | +0x100 when timed, 0,
+            // [x25,#4] as receive size, x24 = receive port, x23 = timeout, 0)`, and its kr (x26)
+            // tolerates {0, 0x10004004 TOO_LARGE, 0x10004003 TIMED_OUT} before the trap. So the
+            // dying call's rejected arguments = the buffer words: msgh_bits/size/id/dest,
+            // msgh_type/msgh_descriptor_count, and the slot.
+            if state.__x.25 != 0, let buffer = messageBuffer(at: state.__x.25) {
+                NSLog("noborder watch: msg buffer at x25=0x\(String(state.__x.25, radix: 16)):"
+                      + buffer.map { "0x" + String($0, radix: 16) }.joined(separator: " "))
+            }
+            if let slot = readWord32(at: state.__sp &+ 8) {
+                NSLog("noborder watch: [sp+8] = 0x\(String(slot, radix: 16))")
+            }
+        } else {
+            NSLog("noborder watch: exception=\(fault.exception) codes=\(fault.codes) (no thread state)")
+        }
+        reply(.failure, to: fault.header)
+        release(fault)
+        return true
+    }
+
+    /// The words of a received `mach_msg_header_t` + `mach_msg_body_t`, read from the target:
+    /// bits, size, id, destination, then type and descriptor count.
+    private func messageBuffer(at address: UInt64) -> [UInt32]? {
+        var words: [UInt32] = []
+        for offset in stride(from: 0, to: 20, by: 4) {
+            guard let word = readWord32(at: address &+ UInt64(offset)) else { return nil }
+            words.append(word)
+        }
+        return words
+    }
+
+    private func readWord32(at address: UInt64) -> UInt32? {
+        var value: UInt32 = 0
+        var sent: vm_size_t = 0
+        let kr = withUnsafeMutableBytes(of: &value) { raw in
+            vm_read_overwrite(task.port, vm_address_t(address), vm_size_t(MemoryLayout<UInt32>.size),
+                              vm_address_t(bitPattern: raw.baseAddress!), &sent)
+        }
+        return kr == KERN_SUCCESS ? value : nil
     }
 
     /// Answer anything still waiting for us, put the app's own handlers back, drop our port.
@@ -112,13 +196,39 @@ final class FaultGuard {
     /// us but takes none back, so the thread would stay pointed at the faulting instruction.
     /// (Measured: the app's thread is back in `mach_msg2_trap` afterwards, and parks there.)
     ///
+    /// The dispatched mode's one difference: when the fault is inside the block — the thread's sp
+    /// is on its real stack, not the fabricated frame we entered on — the parked restore is
+    /// *not* safe: the thread is in the app's own libdispatch/CF machinery, and pulling it out
+    /// mid-drain corrupts it (measured 2026-10-20: the app died). The faulted block is resumed at
+    /// `resumeAt` (its epilogue) on the frame it built, so it returns to libdispatch normally and
+    /// the drain completes; only a fault in the stub gets the parked restore.
+    ///
     /// Any other fault is answered KERN_FAILURE and returns false, so the caller keeps waiting for
     /// the script: that fault is the app's, not ours, and we cannot put it right.
-    func tookFault(on main: MainThread, restoringTo state: arm_thread_state64_t) -> Bool {
+    func tookFault(on main: MainThread, restoringTo state: arm_thread_state64_t,
+                   resumeAt: UInt64 = 0, frameLo: UInt64 = 1, frameHi: UInt64 = 0) -> Bool {
         guard receive != 0, let fault = receiveFault() else { return false }
-        guard kernelThreadID(of: fault.thread) == main.id,
-              MainThread(port: fault.thread, id: main.id).setState(state) else {
-            reply(.failure, to: fault.header)   // not ours, or we cannot put it right
+        guard kernelThreadID(of: fault.thread) == main.id else {
+            reply(.failure, to: fault.header)   // not ours
+            release(fault)
+            return false
+        }
+        let thread = MainThread(port: fault.thread, id: main.id)
+        if ProcessInfo.processInfo.environment["NOBORDER_GUARD_LOG"] == "1", let now = thread.state() {
+            NSLog("noborder fault: exception=\(fault.exception) codes=\(fault.codes.map { String(format: "0x%x", $0) })"
+                  + " pc=0x\(String(now.__pc, radix: 16)) sp=0x\(String(now.__sp, radix: 16))"
+                  + Self.registerLine(now)
+                  + " lr=0x\(String(now.__lr, radix: 16))")
+        }
+        var resumeState = state
+        if resumeAt != 0, let now = thread.state(),
+           !(frameLo <= now.__sp && now.__sp <= frameHi) {
+            // sp says the block: keep the block's own frame and registers, step it home.
+            resumeState = now
+            resumeState.__pc = resumeAt
+        }
+        guard thread.setState(resumeState) else {
+            reply(.failure, to: fault.header)   // we cannot put it right
             release(fault)
             return false
         }
@@ -127,8 +237,18 @@ final class FaultGuard {
         return true
     }
 
+    private static func registerLine(_ state: arm_thread_state64_t) -> String {
+        var line = ""
+        withUnsafeBytes(of: state.__x) { raw in
+            for index in 0...28 {
+                line += " x\(index)=0x" + String(raw.load(fromByteOffset: index * 8, as: UInt64.self), radix: 16)
+            }
+        }
+        return line
+    }
+
     /// What the task had for the masks we are about to take.
-    private func readAppHandlers() -> Bool {
+    private func readAppHandlers(_ take: exception_mask_t) -> Bool {
         var masks = [exception_mask_t](repeating: 0, count: Self.arrayCount)
         var handlers = [mach_port_t](repeating: 0, count: Self.arrayCount)
         var behaviors = [exception_behavior_t](repeating: 0, count: Self.arrayCount)
@@ -138,7 +258,7 @@ final class FaultGuard {
             handlers.withUnsafeMutableBufferPointer { handlersPtr in
                 behaviors.withUnsafeMutableBufferPointer { behaviorsPtr in
                     flavors.withUnsafeMutableBufferPointer { flavorsPtr in
-                        task_get_exception_ports(task.port, Self.masks, masksPtr.baseAddress!, &count,
+                        task_get_exception_ports(task.port, take, masksPtr.baseAddress!, &count,
                                                 handlersPtr.baseAddress!, behaviorsPtr.baseAddress!,
                                                 flavorsPtr.baseAddress!)
                     }
@@ -147,7 +267,7 @@ final class FaultGuard {
         }
         guard kr == KERN_SUCCESS else { return false }
         for index in 0..<min(Int(count), Self.arrayCount) {
-            let intersection = masks[index] & Self.masks
+            let intersection = masks[index] & take
             if intersection != 0 {
                 saved.append((intersection, handlers[index], behaviors[index], flavors[index]))
             }
@@ -240,3 +360,25 @@ final class FaultGuard {
 
 /// A null port name. Swift imports `MACH_PORT_NULL` as Int32; the ports here are `mach_port_t`.
 private let noPort: mach_port_t = mach_port_t(MACH_PORT_NULL)
+
+/// Tests only: a long-lived exception port on a target, for catching the state a crash happens
+/// in when ReportCrash has stopped writing reports (`probe watch <pid>`, with
+/// `NOBORDER_GUARD_BREAKPOINT=1` in the environment). It is not part of any run; the app's own
+/// handlers are restored when it is removed.
+public final class ExceptionWatch {
+    private let task: TargetTask
+    private let faultGuard: FaultGuard
+
+    public init(pid: Int32) throws {
+        task = try TargetTask(pid: pid)
+        faultGuard = FaultGuard(task: task)
+    }
+
+    @discardableResult
+    public func install() -> Bool { faultGuard.install(masks: FaultGuard.diagnosticMasks) }
+
+    @discardableResult
+    public func drainAndLog() -> Bool { faultGuard.drainAndLog() }
+
+    public func remove() { faultGuard.remove() }
+}

@@ -2,12 +2,21 @@ import AppKit
 import Foundation
 import NoBorderEngine
 import NoBorderLogic
+import NoBorderNative
+
+/// SIGUSR1 = Off, SIGUSR2 = On, for the tests: the C handlers are file-scope (a C function
+/// pointer cannot name a MainActor member) and call the installed instance hook. Off persists
+/// to UserDefaults like the menu toggle does, so a test that stops the loop must re-enable
+/// before the next launch.
+private var toggleHandler: ((_ on: Bool) -> Void)?
+private func onSIGUSR1(_: Int32) { toggleHandler?(false) }
+private func onSIGUSR2(_: Int32) { toggleHandler?(true) }
 
 /// The app's engine: the scan loop, running in this process. This is the one object the menu talks
 /// to, and the only place that decides when the loop runs.
 ///
 /// The window changes themselves are made inside the apps that own them: see `ScanLoop` and
-/// `NativeEngine`.
+/// `AgentEngine`.
 /// The "hide window buttons" option, readable from the scan loop's queue. The menu writes it; the
 /// loop's cycle reads it. A lock makes that handoff a plain fact, not a race to reason about.
 final class ButtonSetting {
@@ -31,6 +40,8 @@ final class EngineManager: ObservableObject {
     /// Shared with the scan loop, which reads it on its own queue every cycle.
     private let buttonSetting: ButtonSetting
     private var loop: ScanLoop?
+    /// The focus-change listener, alive while the loop is.
+    private var activation: NSObjectProtocol?
     private var log: FileHandle? = LogFile.open()
 
     /// The only way `status` is set. The loop reports the number of windows it has changed on every
@@ -40,19 +51,39 @@ final class EngineManager: ObservableObject {
         self?.status = next
     }
 
+    // Publication state (user decision 2026-10-21): the app runs on the resident agent. The
+    // changes are messages to a CFMachPort source in the target's own run loop — no thread
+    // entry per change; the dispatched entry (the Phase-0 hardened shape, poison.sh green)
+    // runs only for agent install/removal and the 2 s-floored key reads. Quit removes every
+    // installed agent, and restores every window it changed first.
+
+    /// Said once per scan session, in the app's log, before the loop asks for anything: the mode,
+    /// and the recovery path for windows an older, injecting build left changed (verdict 4,
+    /// 2026-10-20: the line must arrive even when no window qualifies, and must name the way back).
+    static let modeLine = "resident agent: changes are messages, no per-change thread entry; "
+        + "quit removes the agents; an older build's leftovers: noborder-probe restore"
+
     init() {
         enabled = UserDefaults.standard.object(forKey: "enabled") as? Bool ?? true
         let buttons = UserDefaults.standard.bool(forKey: "hideButtons")
         hideButtons = buttons
         buttonSetting = ButtonSetting(on: buttons)
-        // A Dock quit, a Cmd-Q, a "Quit" from anywhere: the windows we changed go back before the
-        // process goes, which is the whole reason the app is the one making the changes.
+        // A Dock quit, a Cmd-Q, a "Quit" from anywhere: the loop stops before the process goes,
+        // and that stop puts every window the agent changed back and removes the agents.
         NotificationCenter.default.addObserver(
             forName: NSApplication.willTerminateNotification, object: nil, queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated { self?.stop() }
         }
         if enabled { start() }
+        // SIGUSR1 = the menu's Off, SIGUSR2 = the menu's On, for the tests (the hostapp apps
+        // take signals the same way): stop() restores and releases, and the app stays alive so
+        // the log lines land.
+        toggleHandler = { [weak self] on in
+            DispatchQueue.main.async { MainActor.assumeIsolated { self?.setEnabled(on) } }
+        }
+        signal(SIGUSR1, onSIGUSR1)
+        signal(SIGUSR2, onSIGUSR2)
     }
 
     func setEnabled(_ on: Bool) {
@@ -69,7 +100,7 @@ final class EngineManager: ObservableObject {
         UserDefaults.standard.set(on, forKey: "hideButtons")
     }
 
-    /// Quit: put the user's windows back first, then leave.
+    /// Quit: stop the loop (which restores the changed windows and removes the agents), then leave.
     func quit() {
         stop()
         NSApplication.shared.terminate(nil)
@@ -79,32 +110,47 @@ final class EngineManager: ObservableObject {
 
     private func start() {
         guard loop == nil else { return }
-        // The engine is built with a forwarder because the loop's log is the place its lines are
-        // filtered, and an engine is constructed before the loop that owns it.
-        let forward = EngineLogForward()
-        let engine = NativeEngine(log: forward.say)
+        // The resident-agent engine: changes are messages to the agent;
+        // key reads ride the shipped floored path. The loop's log closure is the one path
+        // lines take to the file, and the engine's refusals speak through it too.
+        let engineLog: (String) -> Void = { [weak self] line in
+            DispatchQueue.main.async { MainActor.assumeIsolated { self?.write(line) } }
+        }
+        let engine = AgentEngine(log: engineLog)
         let newLoop = ScanLoop(scan: { WindowScan.scan() },
                                tracker: WindowTracker(),
                                engine: engine,
                                buttonsHidden: { [buttonSetting] in buttonSetting.isOn },
-                               log: { [weak self] line in
-                                   DispatchQueue.main.async { MainActor.assumeIsolated { self?.write(line) } }
-                               },
+                               log: engineLog,
                                status: { [weak self] changed in
                                    DispatchQueue.main.async { MainActor.assumeIsolated { self?.changed(changed) } }
                                })
-        forward.next = newLoop.engineLog()
+        write(Self.modeLine)
         loop = newLoop
         newLoop.start()
+        // A focus change is the moment an app repaints its decorations over our change, and
+        // NSWorkspace says when one happens — in-process, no polling. The loop's cycle, kicked at
+        // that moment, puts the change back in milliseconds; the 250 ms scan stays the floor for
+        // everything else.
+        activation = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.loop?.kick() }
+        }
         reported.started()
         reported.set(.running(windows: 0))
     }
 
-    /// Stopping is synchronous on purpose: the loop's `stop` is what puts every changed window back,
-    /// and the app must not be gone before that has been asked for.
+    /// Stopping is synchronous on purpose: the loop's `stop` is what puts every changed window back
+    /// and releases the engine's holds (it removes the agents), and the app must not be gone before
+    /// that has been asked for.
     private func stop() {
         guard let loop = loop else { return }
         self.loop = nil
+        if let activation {
+            NSWorkspace.shared.notificationCenter.removeObserver(activation)
+            self.activation = nil
+        }
         reported.stopped()
         loop.stop()
         reported.set(.off)
@@ -120,10 +166,4 @@ final class EngineManager: ObservableObject {
         guard let log else { return }
         if !LogFile.write(log, line) { self.log = nil }
     }
-}
-
-/// The engine's log path, before the loop exists to filter it.
-private final class EngineLogForward {
-    var next: ((String) -> Void)?
-    func say(_ line: String) { next?(line) }
 }

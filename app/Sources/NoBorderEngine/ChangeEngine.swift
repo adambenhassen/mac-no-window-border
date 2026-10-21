@@ -28,6 +28,19 @@ public protocol ChangeEngine: AnyObject {
     @discardableResult
     func restore(pid: pid_t, windows: [UInt32]) -> [UInt32]
 
+    /// What these windows of one process answer to the app's own `isKeyWindow`, per window. The key
+    /// state is not the border: it is the event that puts the border back. Apps repaint their
+    /// decorations around focus transitions — AppKit's key rim comes back on focus-in, iTerm draws
+    /// its outline on focus-out (measured 2026-10-20) — and the properties that store our change
+    /// do not say so. A window whose key state changed since the last read is one whose decoration
+    /// was just repainted.
+    ///
+    /// The answer is only ever about what a read saw: a busy app, an unreachable target, a process
+    /// with no AppKit — all report the empty dictionary, because the caller's answer to "the read
+    /// did not run" is to leave the window as it is and ask again on a later scan. A read that ran
+    /// answers every window it was given, key and not-key alike.
+    func keyWindows(pid: pid_t, windows: [UInt32]) -> [UInt32: Bool]
+
     /// Release everything held on other processes: their task ports, their scratch memory.
     func shutdown()
 }

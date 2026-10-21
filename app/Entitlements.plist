@@ -2,7 +2,11 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<!-- task_for_pid on other apps' processes. Without it the engine gets KERN_FAILURE. -->
+	<!-- The task-port authority the resident agent runs on (publication decision 2026-10-21,
+	     superseding verdict 3's scanner-only link layout): the app opens the task port to install
+	     and remove the agent, and for the 2 s-floored key reads. The older "giving it to the app
+	     stalled live apps" finding is about the retired engine, which entered every changed
+	     window's app on every scan; this path enters a target once for install, once for removal. -->
 	<key>com.apple.security.cs.debugger</key>
 	<true/>
 </dict>

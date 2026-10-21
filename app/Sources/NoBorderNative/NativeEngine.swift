@@ -1,3 +1,4 @@
+import NoBorderEngine
 import Darwin
 
 /// What one call in one target produced: the outcome of the run, and the word the script handed back
@@ -55,6 +56,42 @@ public final class NativeEngine: ChangeEngine {
     @discardableResult
     public func restore(pid: pid_t, windows: [UInt32]) -> [UInt32] {
         change(.restored(windowNumbers: windows), pid: pid, windows: windows, verb: "restoring")
+    }
+
+    public func keyWindows(pid: pid_t, windows: [UInt32]) -> [UInt32: Bool] {
+        let batch = windows.map(String.init).joined(separator: " ")
+        guard !windows.isEmpty else { return [:] }
+        guard let known = appKit[pid] else {
+            let probe = runner.run(.appKitProbe(), in: pid)
+            // A read that did not run answers nothing — unlike a change that did not run, which
+            // hands its windows back: a read asks, a change acts.
+            guard probe.result == .ok else { _ = report(probe, pid: pid, windows: windows, verb: "reading"); return [:] }
+            let isAppKit = (probe.word ?? 0) != 0
+            appKit[pid] = isAppKit
+            guard isAppKit else {
+                log("skipped (not AppKit) \(pid) \(batch)")
+                return [:]
+            }
+            return keyWindows(pid: pid, windows: windows)   // now known: ask the windows
+        }
+        guard known else {
+            log("skipped (not AppKit) \(pid) \(batch)")
+            return [:]
+        }
+        let outcome = runner.run(.keyStateRead(windowNumbers: windows), in: pid)
+        guard outcome.result == .ok else { _ = report(outcome, pid: pid, windows: windows, verb: "reading"); return [:] }
+        guard let word = outcome.word else {
+            log("engine failed \(pid) \(batch): no result word")
+            return [:]
+        }
+        // One answer bit per window, packed by the generator walking the list: window i of the
+        // batch sits at bit `count-1-i`. A read that ran answers every window it was given.
+        let count = windows.count
+        var states: [UInt32: Bool] = [:]
+        for (i, wid) in windows.enumerated() {
+            states[wid] = word & (1 << UInt64(count - 1 - i)) != 0
+        }
+        return states
     }
 
     public func shutdown() {
@@ -139,7 +176,8 @@ final class ProcessRunner: NativeEngine.Runner {
             return CallOutcome(result: .failed("no main thread"), word: nil)
         }
         let (result, _) = target.executor.run(script, on: main, addresses: addresses)
-        return CallOutcome(result: result, word: script.appKitProbe ? target.executor.lastResultWord : nil)
+        let writesWord = script.appKitProbe || script.keyStateRead
+        return CallOutcome(result: result, word: writesWord ? target.executor.lastResultWord : nil)
     }
 
     func shutdown() {

@@ -2,3 +2,7 @@ build/
 app/.build/
 tests/hostapp
 tests/winpixels
+tests/pxband
+tests/wbounds
+tests/plainrunloop
+.DS_Store

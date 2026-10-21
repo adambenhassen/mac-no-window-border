@@ -103,7 +103,8 @@ public enum WindowScan {
     public static func scan() -> [ScannedWindow] {
         let visible = visibleFramesAsCG()
         return normalWindows().map { window in
-            ScannedWindow(wid: window.wid, pid: window.pid, maximized: isMaximized(window.frame, in: visible))
+            ScannedWindow(wid: window.wid, pid: window.pid,
+                          maximized: isMaximized(window.frame, in: visible))
         }
     }
 

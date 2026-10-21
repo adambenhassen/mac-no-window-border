@@ -21,8 +21,15 @@ public struct MainThread {
 }
 
 extension MainThread {
-    public func suspend() { thread_suspend(port) }
-    public func resume() { thread_resume(port) }
+    /// Stop and restart the thread. The executor stops it *before* reading its state: a thread that
+    /// wakes between a read and an entry is running app code, and the read is a frame the app has
+    /// left (measured: entering on it dies). While the thread is stopped, what we read is exactly
+    /// what it resumes with, so a check taken now cannot go stale.
+    @discardableResult
+    public func suspend() -> kern_return_t { thread_suspend(port) }
+
+    @discardableResult
+    public func resume() -> kern_return_t { thread_resume(port) }
 
     /// What the kernel says the thread is doing. A thread parked in its run loop's mach call reports
     /// TH_WAIT; one that has woken and is running app code reports TH_RUN. This is the only way to
@@ -93,6 +100,11 @@ extension TargetTask {
     private static let idleTraps: Set<String> = ["mach_msg2_trap", "mach_msg_trap"]
     private static let runLoopPortFrame = "__CFRunLoopServiceMachPort"
     private static let maxFrames = 10
+    /// `MACH_RCV_MSG` / `MACH_RCV_TIMEOUT` from <mach/message.h> (this SDK: 0x2 / 0x100; 0x10 is
+    /// `MACH_SEND_TIMEOUT`), request bits of the in-flight `mach_msg2` (the request sits in x1;
+    /// x0 is the message pointer).
+    private static let machRcvMsg: UInt64 = 0x2
+    private static let machRcvTimeout: UInt64 = 0x100
 
     /// The process's main thread. A process's first thread is created at exec, before any
     /// `pthread_create`, and the kernel numbers thread ids in creation order, so the main thread
@@ -106,11 +118,19 @@ extension TargetTask {
             vm_deallocate(mach_task_self_, vm_address_t(UInt(bitPattern: list)),
                           vm_size_t(UInt(count) * UInt(MemoryLayout<thread_act_t>.size)))
         }
+        // `task_threads` hands us a send right per thread. Every one that is not the answer is
+        // dropped here; the chosen port's life belongs to the MainThread we return.
         var found: MainThread?
         for index in 0..<Int(count) {
-            guard let id = kernelThreadID(of: list[index]) else { continue }
+            guard let id = kernelThreadID(of: list[index]) else {
+                mach_port_deallocate(mach_task_self_, list[index])
+                continue
+            }
             if found == nil || id < found!.id {
+                if let previous = found { mach_port_deallocate(mach_task_self_, previous.port) }
                 found = MainThread(port: list[index], id: id)
+            } else {
+                mach_port_deallocate(mach_task_self_, list[index])
             }
         }
         return found
@@ -125,6 +145,24 @@ extension TargetTask {
     /// stopped, so the answer cannot change underneath the decision.
     public func parkState(from state: arm_thread_state64_t) -> ParkState {
         guard let innerFrame = symbolName(at: state.__pc), Self.idleTraps.contains(innerFrame) else {
+            return .running
+        }
+        // The trap is a `mach_msg2` call in flight, its request in x1. The entry restarts that
+        // call from its start, and the raw `mach_msg2_trap` rejects a **timed** receive — one
+        // whose request carries `MACH_RCV_TIMEOUT` (0x100) — with `MACH_RCV_INVALID_ARGUMENTS`
+        // (0x10004013): reproduced in-process and in the stub's own absorber (identical kr,
+        // 2026-10-20). CoreFoundation's `__CFRunLoopServiceMachPort` tolerates only {success,
+        // TOO_LARGE (0x10004004), TIMED_OUT (0x10004003)} — `INVALID_ARGUMENTS` reaches its
+        // "unexpected kr" trap and the app dies (`__CFRunLoopServiceMachPort.cold.1`; the
+        // iTerm/Vivaldi class; five watch-captured hostapps, every death this kr). CF switches
+        // the service-port wait to its timed shape while timers are pending, i.e. exactly when
+        // wake traffic is being serviced; plain parks (0x507000806-form, no 0x100) restart
+        // cleanly — the form every clean entry ran on. Refuse the timed shape. (Earlier gates
+        // guarded 0x400 = `MACH_RCV_INTERRUPT`, then 0x10 = `MACH_SEND_TIMEOUT` — both the wrong
+        // bit; the header values are the ground truth.) Deferring the servicing moment is the
+        // same answer as any busy target; it lasts microseconds, and the scan loop retries
+        // every 250 ms.
+        guard state.__x.1 & Self.machRcvMsg != 0, state.__x.1 & Self.machRcvTimeout == 0 else {
             return .running
         }
         var frames = [innerFrame]

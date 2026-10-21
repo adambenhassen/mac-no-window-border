@@ -145,6 +145,146 @@ final class WindowTrackerTests: XCTestCase {
                       "an applied window asked for hidden buttons needs nothing while the option is on")
     }
 
+    // MARK: - the app undid our change (the focus-transition case, measured 2026-10-20)
+
+    /// The reads, per cycle: the first is the baseline, and each later one flips the state, so each
+    /// is a focus transition — the event that repaints the app's drawing over our change (AppKit's
+    /// rim on focus-in, iTerm's outline on focus-out).
+    private func flip(tracker: WindowTracker, at: TimeInterval, key: Bool, buttonsHidden: Bool = false) -> TrackerDecision {
+        tracker.update(windows: [window()], at: at, buttonsHidden: buttonsHidden, keyStates: [1: key])
+    }
+
+    func testAWindowAtAKeyStateTransitionIsAppliedAgainOnTheSpot() {
+        let tracker = WindowTracker()
+        settle(tracker, [window()], from: 0)
+        assertNothing(flip(tracker: tracker, at: 5.0, key: false), "the first read is the baseline, not a transition")
+        XCTAssertEqual(flip(tracker: tracker, at: 5.25, key: true).apply, [pid: [1]],
+                       "focus-in: the transition asks for the change back, no settle")
+        assertNothing(flip(tracker: tracker, at: 5.5, key: true), "and it is not asked over and over while the state is steady")
+    }
+
+    func testTheUndoBudgetStartsOverWhenTheKeyStateGoesSteady() {
+        let tracker = WindowTracker()
+        settle(tracker, [window()], from: 0)
+        flip(tracker: tracker, at: 5.0, key: false)                     // baseline
+        for (at, key) in [(5.25, true), (5.5, false), (5.75, true)] {   // strikes 1, 2, 3
+            XCTAssertEqual(flip(tracker: tracker, at: at, key: key).apply, [pid: [1]])
+        }
+        assertNothing(flip(tracker: tracker, at: 6.0, key: true), "steady: the budget starts over")
+        XCTAssertEqual(flip(tracker: tracker, at: 6.25, key: false).apply, [pid: [1]],
+                       "a fresh budget: this transition is the first of a new streak, not the fourth")
+    }
+
+    func testAWindowFlippingPastItsBudgetIsLeftAloneAndNamedOnce() {
+        let tracker = WindowTracker()
+        settle(tracker, [window()], from: 0)
+        flip(tracker: tracker, at: 5.0, key: false)                     // baseline
+        for (at, key) in [(5.25, true), (5.5, false), (5.75, true)] {   // strikes 1, 2, 3
+            XCTAssertEqual(flip(tracker: tracker, at: at, key: key).apply, [pid: [1]])
+        }
+        let fourth = flip(tracker: tracker, at: 6.0, key: false)
+        assertNothing(fourth, "the fourth transition is past the budget: no more asking")
+        XCTAssertEqual(fourth.gaveUp, [pid: [1]], "and the window is named, once")
+        let fifth = flip(tracker: tracker, at: 6.25, key: true)
+        assertNothing(fifth, "left alone means left alone")
+        XCTAssertEqual(fifth.gaveUp, [:], "naming it again every scan is a line four times a second")
+    }
+
+    func testUserTransitionsAreServedEveryTimeAndStrikeNothing() {
+        let tracker = WindowTracker()
+        settle(tracker, [window()], from: 0)
+        flip(tracker: tracker, at: 5.0, key: false)                      // baseline
+        for i in 0..<18 {                                                // 18 app switches: every flip a transition
+            let at = 5.25 + Double(i) * 0.25
+            XCTAssertEqual(tracker.update(windows: [window()], at: at, keyStates: [1: i % 2 == 0],
+                                          transitionsAreUser: true).apply, [pid: [1]],
+                           "the user's app switching is not a flap war: every flip is served, the budget untouched")
+        }
+    }
+
+    func testAKickReassertsASteadyWindow() {
+        // The live iTerm case (2026-10-21): switch away and back, the focus repaint lands
+        // AFTER the transition's answer — the key state reads steady and the outline stands.
+        // The kick cycle asks for the change again even when nothing transitioned.
+        let tracker = WindowTracker()
+        settle(tracker, [window()], from: 0)
+        flip(tracker: tracker, at: 5.0, key: true)                        // baseline, applied
+        XCTAssertEqual(tracker.update(windows: [window()], at: 5.25, keyStates: [1: true],
+                                      transitionsAreUser: true).apply, [pid: [1]],
+                       "a focus event with a steady key state is a repaint to answer, not silence")
+        assertNothing(tracker.update(windows: [window()], at: 5.5, keyStates: [1: true]),
+                      "a timer scan with a steady state stays quiet: the re-assert is the event, not 4 Hz")
+    }
+
+    func testAKickReassertsEvenWhenNoKeyReadRan() {
+        // The real bug (2026-10-21): at focus-in the app is busy repainting, so the native key
+        // read times out (~200 ms, measured) and answers nothing. With no key reading the
+        // window must STILL be re-asserted on a user kick — the agent op is a queued message
+        // that drains without a park — or the repainted outline stands. The loop's fake engine
+        // always answers, so only here is the empty read exercised.
+        let tracker = WindowTracker()
+        settle(tracker, [window()], from: 0)
+        XCTAssertEqual(tracker.update(windows: [window()], at: 5.0, transitionsAreUser: true).apply, [pid: [1]],
+                       "a focus kick with no key read re-asserts the applied window")
+    }
+
+    func testAUserTransitionResumesASurrenderedWindow() {
+        let tracker = WindowTracker()
+        settle(tracker, [window()], from: 0)
+        for (at, key) in [(5.0, false), (5.25, true), (5.5, false), (5.75, true), (6.0, false)] {
+            _ = flip(tracker: tracker, at: at, key: key)   // baseline, strikes 1-3, surrender
+        }
+        assertNothing(flip(tracker: tracker, at: 6.25, key: true), "surrendered: timer transitions are left alone")
+        XCTAssertEqual(tracker.update(windows: [window()], at: 6.5, keyStates: [1: false],
+                                      transitionsAreUser: true).apply, [pid: [1]],
+                       "the user's switch is a new event, not the flap war that gave up on: back in service")
+    }
+
+    func testAWindowWithNoReadAnswersNothing() {
+        let tracker = WindowTracker()
+        settle(tracker, [window()], from: 0)
+        flip(tracker: tracker, at: 5.0, key: false)                       // baseline
+        XCTAssertEqual(flip(tracker: tracker, at: 5.25, key: true).apply, [pid: [1]], "strike 1")
+        assertNothing(tracker.update(windows: [window()], at: 5.5), "a read that did not run concludes nothing")
+        XCTAssertEqual(flip(tracker: tracker, at: 5.75, key: false).apply, [pid: [1]],
+                       "and the missing read neither strikes nor spends the budget: this is strike 2")
+    }
+
+    func testASurrenderedWindowIsRestoredWhenItUnMaximizesAndReArmsAfterThat() {
+        let tracker = WindowTracker()
+        settle(tracker, [window()], from: 0)
+        for (at, key) in [(5.0, false), (5.25, true), (5.5, false), (5.75, true), (6.0, false)] {
+            _ = flip(tracker: tracker, at: at, key: key)   // baseline, strikes 1-3, surrender
+        }
+        assertNothing(tracker.update(windows: [window(maximized: false)], at: 6.5), "the restore settle starts")
+        XCTAssertEqual(tracker.update(windows: [window(maximized: false)], at: 7.0).restore, [pid: [1]],
+                       "the border we left in place goes back like any other applied window's")
+        XCTAssertEqual(settle(tracker, [window()], from: 7.5).apply, [pid: [1]], "and a new stay starts clean")
+    }
+
+    func testTheButtonsOptionReachesASurrenderedWindow() {
+        let tracker = WindowTracker()
+        settle(tracker, [window()], from: 0)
+        for (at, key) in [(5.0, false), (5.25, true), (5.5, false), (5.75, true), (6.0, false)] {
+            _ = flip(tracker: tracker, at: at, key: key)   // baseline, strikes 1-3, surrender
+        }
+        assertNothing(flip(tracker: tracker, at: 6.25, key: true), "surrendered")
+        XCTAssertEqual(tracker.update(windows: [window()], at: 6.5, buttonsHidden: true, keyStates: [1: true]).apply,
+                       [pid: [1]], "the user's option is a new ask, and the ask re-arms the window")
+        XCTAssertEqual(flip(tracker: tracker, at: 6.75, key: false, buttonsHidden: true).apply, [pid: [1]],
+                       "budget spent, budget earned: the re-arm gives it the strikes back")
+    }
+
+    func testAppliedWindowsAreGroupedByOwnerAndOnlyTheSeenOnes() {
+        let tracker = WindowTracker()
+        XCTAssertEqual(settle(tracker, [window(1), window(2), window(3, of: 600)], from: 0).apply,
+                       [pid: [1, 2], 600: [3]])
+        XCTAssertEqual(tracker.appliedWindows(in: [window(1), window(2), window(3, of: 600), window(4, of: 700)]),
+                       [pid: [1, 2], 600: [3]], "a read batch is one stop in one app: grouped by owner")
+        XCTAssertEqual(tracker.appliedWindows(in: []), [:], "a window off screen is not read")
+        XCTAssertEqual(tracker.appliedWindows(in: [window(9)]), [:], "a window that is not ours is not read")
+    }
+
     // MARK: - a batch the engine did not run
 
     /// The loop has already emitted the apply; the app was busy, so nothing changed. The window is

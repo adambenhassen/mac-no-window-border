@@ -33,9 +33,14 @@ final class ScanLoopTests: XCTestCase {
         }
 
         var calls: [Call] = []
+        /// Every key state read, recorded the same way as a change.
+        private(set) var reads: [Call] = []
         var shutdowns = 0
         /// Windows this engine refuses to touch, so the loop is told to ask again.
         var deferred: Set<UInt32> = []
+        /// The key state this engine answers, per window: a change between reads is a focus
+        /// transition, and a transition is what puts the app's drawing back.
+        var keyStates: [UInt32: Bool] = [:]
         /// Makes a call take this long, to see whether cycles overlap.
         var slow: TimeInterval = 0
         private(set) var maxConcurrent = 0
@@ -52,6 +57,14 @@ final class ScanLoopTests: XCTestCase {
 
         @discardableResult
         func restore(pid: pid_t, windows: [UInt32]) -> [UInt32] { change(pid: pid, windows: windows, restoring: true) }
+
+        func keyWindows(pid: pid_t, windows: [UInt32]) -> [UInt32: Bool] {
+            enter()
+            reads.append(Call(pid: pid, windows: windows, restoring: false))
+            leave()
+            // A read that ran answers every window it was given; the answer defaults to not key.
+            return Dictionary(uniqueKeysWithValues: windows.map { ($0, keyStates[$0] ?? false) })
+        }
 
         @discardableResult
         private func change(pid: pid_t, windows: [UInt32], restoring: Bool, buttonsHidden: Bool = false) -> [UInt32] {
@@ -96,7 +109,8 @@ final class ScanLoopTests: XCTestCase {
         ScannedWindow(wid: wid, pid: pid, maximized: maximized)
     }
 
-    private func makeLoop(interval: TimeInterval = 0.25, realClock: Bool = false) {
+    private func makeLoop(interval: TimeInterval = 0.25, realClock: Bool = false,
+                          keyReadInterval: TimeInterval = 0) {
         clock = FakeClock()
         scan = FakeScan()
         forward = LogForward()
@@ -108,6 +122,7 @@ final class ScanLoopTests: XCTestCase {
                        tracker: WindowTracker(),
                        engine: engine,
                        buttonsHidden: { [weak self] in self?.hideButtons ?? false },
+                       keyReadInterval: keyReadInterval,
                        log: { [weak self] line in self?.logs.append(line) },
                        status: { [weak self] n in self?.statuses.append(n) })
         forward.next = loop.engineLog()
@@ -265,6 +280,124 @@ final class ScanLoopTests: XCTestCase {
         XCTAssertEqual(engine.calls.count, asks, "once it lands, asking stops")
     }
 
+    // MARK: - the app undid our change: read the key state, re-ask, and stop fighting
+
+    func testAppliedWindowsGetTheirKeyStateReadEveryCycle() {
+        makeLoop()
+        scan.windows = [window()]
+        cycle(at: 0)
+        cycle(at: 0.5)                                   // applied
+        cycle(at: 1.0)
+        XCTAssertEqual(engine.reads.last, FakeEngine.Call(pid: pid, windows: [1], restoring: false),
+                       "an applied, visible window is asked of the engine every cycle")
+    }
+
+    func testAWindowTheScanDoesNotSeeIsNeverRead() {
+        makeLoop()
+        scan.windows = [window()]
+        cycle(at: 0)
+        cycle(at: 0.5)
+        let asked = engine.reads.count
+        scan.windows = []
+        cycle(at: 1.0)
+        XCTAssertEqual(engine.reads.count, asked, "the window is off screen: nothing is asked of the engine")
+    }
+
+    func testOnlyAppliedWindowsGetTheirKeyStateRead() {
+        makeLoop()
+        scan.windows = [window(1), window(2, maximized: false)]
+        cycle(at: 0)
+        cycle(at: 0.5)
+        cycle(at: 1.0)
+        XCTAssertEqual(engine.reads.last?.windows, [1],
+                       "the un-maximized window the scan sees is not ours to read; the applied one is, from the cycle after the apply lands")
+    }
+
+    func testAKeyStateTransitionIsAppliedAgainOnTheSpot() {
+        makeLoop()
+        scan.windows = [window()]
+        cycle(at: 0)
+        cycle(at: 0.5)
+        cycle(at: 0.75)                                // the first read: the baseline, not a transition
+        engine.keyStates[1] = true                     // focus-in: the transition is the undo
+        cycle(at: 1.0)
+        XCTAssertEqual(engine.calls.last, FakeEngine.Call(pid: pid, windows: [1], restoring: false),
+                       "the cycle that reads the transition is the cycle that asks for the change back")
+        XCTAssertEqual(logs.filter { $0 == "applying 1" }.count, 2, "each apply is said")
+    }
+
+    func testAWindowWhoseFocusKeepsFlippingIsLeftAloneAndSaidOnce() {
+        makeLoop()
+        scan.windows = [window()]
+        cycle(at: 0)
+        cycle(at: 0.5)
+        var key = false
+        var at: TimeInterval = 0.75
+        while at <= 5.0 {                              // every read a transition: the budget's reason
+            engine.keyStates[1] = key
+            key.toggle()
+            cycle(at: at)
+            at += 0.25
+        }
+        XCTAssertEqual(engine.calls.filter { !$0.restoring }.count, 4, "the first apply plus three strikes")
+        XCTAssertEqual(logs.filter { $0.hasPrefix("left alone (kept undoing) 500 1") }.count, 1,
+                       "the window is named once, not every scan")
+    }
+
+    func testKeyReadsAreFlooredAtTheKeyReadInterval() {
+        makeLoop(keyReadInterval: 2)
+        scan.windows = [window()]
+        cycle(at: 0)          // seen: not applied yet, so nothing is asked
+        cycle(at: 0.5)        // the apply lands this cycle: the ask comes on the cycle after it
+        cycle(at: 0.75)       // the first ask
+        cycle(at: 2.5)        // 1.75 s later: inside the floor, no ask
+        cycle(at: 2.75)       // the floor has passed: asked again
+        XCTAssertEqual(engine.reads.count, 2, "one ask at 0.75 and one at 2.75, none in between")
+    }
+
+    func testAFocusKickReassertsWithoutAKeyRead() {
+        makeLoop(keyReadInterval: 2)
+        scan.windows = [window()]
+        cycle(at: 0)
+        cycle(at: 0.5)                                   // applied
+        cycle(at: 0.75)                                  // the first (timer) read
+        let readsBefore = engine.reads.count
+        let appliesBefore = engine.calls.filter { !$0.restoring }.count
+        loop.kick()                                      // a focus change: the repaint event itself
+        loop.step()                                      // one serial queue: the kick's cycle runs first
+        XCTAssertEqual(engine.reads.count, readsBefore,
+                       "a kick does not read: at focus-in the app is busy and the read would time out")
+        XCTAssertEqual(engine.calls.filter { !$0.restoring }.count, appliesBefore + 1,
+                       "the kick re-asserts the applied window anyway — the repaint has to be answered")
+    }
+
+    func testKickedFocusFlipsKeepTheWindowInService() {
+        makeLoop(keyReadInterval: 2)
+        scan.windows = [window()]
+        cycle(at: 0)
+        cycle(at: 0.5)                                   // applied
+        var at: TimeInterval = 0.75
+        while at <= 5.0 {                                // 18 app switches, each a focus kick
+            clock.now = at
+            loop.kick()                                  // a focus change: the user's own switch
+            loop.step()                                  // barrier: the kick's cycle ran
+            at += 0.25
+        }
+        XCTAssertEqual(engine.calls.filter { !$0.restoring }.count, 19,
+                       "the first apply plus a re-assert on each of the 18 kicks — no key read, no baseline exception")
+        XCTAssertEqual(logs.filter { $0.hasPrefix("left alone") }.count, 0,
+                       "app switching is not a flap war: the undo budget is not burned on the user's own switching")
+    }
+
+    func testASteadyKeyStateAsksNothingOfTheTracker() {
+        makeLoop()
+        scan.windows = [window()]
+        cycle(at: 0)
+        cycle(at: 0.5)
+        cycles(from: 0.75, to: 2.0)
+        XCTAssertEqual(engine.calls.filter { !$0.restoring }.count, 1, "a steady read is not an undo, in either state")
+    }
+
     // MARK: - the log the engine writes
 
     /// The engine reports every refusal, on every scan. These are the lines that would print four
@@ -316,6 +449,25 @@ final class ScanLoopTests: XCTestCase {
         loop.stop()
         XCTAssertEqual(engine.shutdowns, 1, "shutdown exactly once")
         XCTAssertEqual(engine.calls.filter { $0.restoring }.count, 1)
+    }
+
+    func testAKickRunsACycleWithoutWaitingForTheTimer() {
+        makeLoop()
+        scan.windows = []
+        let before = scan.calls
+        loop.kick()
+        loop.step()   // one serial queue: the kick's cycle runs before this sync one settles
+        XCTAssertGreaterThanOrEqual(scan.calls, before + 2, "the kick was a cycle, and the step is the next")
+    }
+
+    func testAKickAfterStopRunsNothing() {
+        makeLoop()
+        scan.windows = []
+        loop.stop()
+        let before = scan.calls
+        loop.kick()
+        loop.step()
+        XCTAssertEqual(scan.calls, before, "a stop is the end: a focus event after it is ignored")
     }
 
     func testStoppingANewLoopShutsTheEngineDownOnceAndChangesNothing() {
