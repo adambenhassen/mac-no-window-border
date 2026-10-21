@@ -150,8 +150,16 @@ public final class WindowTracker {
     /// itself out on real switching (measured 2026-10-20: 69 surrenders in a live session, the
     /// user's iTerm window left with its rim). Only transitions a timer read finds on its own —
     /// a window repainting without the user asking — feed the budget.
+    /// `reassert` says this is a floored re-assert cycle (ScanLoop drives it): every applied window
+    /// is asked for again, with no key read, so a change an app has silently undone comes back even
+    /// when nothing transitioned and the app is too busy to read. iTerm rebuilding its tab-bar
+    /// titlebar when a tab opens is the measured case (2026-10-21): not a focus change, not a key
+    /// transition, so neither the kick nor the key read ever catches it. The agent op is idempotent,
+    /// so a window that needs nothing pays a cheap no-op message; a surrendered repaint-war window is
+    /// left alone, not reignited.
     public func update(windows: [ScannedWindow], at now: TimeInterval, buttonsHidden: Bool = false,
-                       keyStates: [UInt32: Bool] = [:], transitionsAreUser: Bool = false)
+                       keyStates: [UInt32: Bool] = [:], transitionsAreUser: Bool = false,
+                       reassert: Bool = false)
                        -> TrackerDecision {
         var decision = TrackerDecision()
         var seen: Set<UInt32> = []
@@ -172,6 +180,18 @@ public final class WindowTracker {
                     record.lastKey = keyStates[window.wid]   // empty on a kick: re-baseline the timer path
                     record.strikes = 0
                     record.surrendered = false
+                    record.buttonsHidden = buttonsHidden
+                    applied[window.wid] = record
+                    pending.removeValue(forKey: window.wid)
+                    decision.apply[window.pid, default: []].append(window.wid)
+                    continue
+                }
+                // A floored re-assert: ask for the removal again on a window that may have been
+                // silently re-decorated by an event that is not a focus change and not a key-state
+                // transition. No key read ran, so nothing is concluded about the key state here; a
+                // surrendered window is left to the timer path below (which, with no read this cycle,
+                // leaves it alone) so a repaint war we gave up on is not reignited every second.
+                if reassert, !record.surrendered {
                     record.buttonsHidden = buttonsHidden
                     applied[window.wid] = record
                     pending.removeValue(forKey: window.wid)

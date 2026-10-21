@@ -51,6 +51,10 @@ let loop = ScanLoop(
     tracker: tracker,
     engine: engine,
     keyReadInterval: 3600,
+    // The floored re-assert is off here: this harness drives the focus kick deterministically
+    // (tests/focus.sh), and a periodic re-assert would interleave extra applies. The re-assert is
+    // covered by the unit tests (ScanLoopTests, WindowTrackerTests) and validated on the live app.
+    reassertInterval: 3600,
     log: { emit("loop: \($0)") },
     status: { n in if n >= 1 && !announced { announced = true; emit("APPLIED") } }
 )

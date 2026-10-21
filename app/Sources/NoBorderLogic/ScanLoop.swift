@@ -47,6 +47,12 @@ public final class ScanLoop {
     /// When each app was last asked for its key windows, and the floor on that ask. See `cycle`.
     private var lastKeyRead: [pid_t: TimeInterval] = [:]
     private let keyReadInterval: TimeInterval
+    /// The last floored re-assert and the floor on it: a re-assert cycle asks for every applied
+    /// window's change again with no key read, so a change an app silently undid (iTerm rebuilding
+    /// its tab-bar titlebar on a tab open — not a focus change, not a key transition) comes back
+    /// even on a busy app the read cannot reach. See `cycle` and `WindowTracker.update(reassert:)`.
+    private var lastReassert: TimeInterval = 0
+    private let reassertInterval: TimeInterval
 
     /// A refusal that is a fact about a process: it will be refused for as long as that process
     /// lives, so the first one is the news.
@@ -63,10 +69,12 @@ public final class ScanLoop {
                 engine: ChangeEngine,
                 buttonsHidden: @escaping ButtonsSetting = { false },
                 keyReadInterval: TimeInterval = 2.0,
+                reassertInterval: TimeInterval = 0.2,
                 log: @escaping Log,
                 status: @escaping Status = { _ in }) {
         self.interval = interval
         self.keyReadInterval = keyReadInterval
+        self.reassertInterval = reassertInterval
         self.now = now
         self.scan = scan
         self.tracker = tracker
@@ -166,6 +174,12 @@ public final class ScanLoop {
         let at = now()
         let hidden = buttonsHidden()
         let windows = scan()
+        // A floored re-assert asks for every applied window's change again with no key read: a
+        // silent re-decoration (iTerm rebuilding its tab-bar titlebar on a tab open, 2026-10-21) is
+        // not a focus change and not a key transition, so neither the kick nor the read catches it,
+        // and the read times out on the busy app it bites. One re-assert per `reassertInterval`.
+        let doReassert = !isUserKick && at - lastReassert >= reassertInterval
+        if doReassert { lastReassert = at }
         var keyStates: [UInt32: Bool] = [:]
         // A key read is an entry into the app: it needs the app's main thread parked, and at
         // focus-in the app is busy repainting, so the read times out (~200 ms, measured
@@ -174,8 +188,8 @@ public final class ScanLoop {
         // The read runs only on the timer path, where it detects an app repainting our change on
         // its own (a repaint war — AppKit's rim, iTerm's outline, both measured 2026-10-20) and
         // feeds the undo budget; it is floored per app because asking every applied window every
-        // cycle cost a measured 5% of a core.
-        if !isUserKick {
+        // cycle cost a measured 5% of a core. A re-assert cycle does no read (it re-applies anyway).
+        if !isUserKick && !doReassert {
             for (pid, wids) in tracker.appliedWindows(in: windows).sorted(by: { $0.key < $1.key }) {
                 if let last = lastKeyRead[pid], at - last < keyReadInterval { continue }
                 lastKeyRead[pid] = at
@@ -183,9 +197,11 @@ public final class ScanLoop {
             }
         }
         // A kick re-asserts applied windows: `transitionsAreUser` makes the tracker serve them
-        // with no key read and without striking — the activation is the user's own switch.
+        // with no key read and without striking — the activation is the user's own switch. A
+        // floored re-assert (`reassert`) serves every applied window the same way, bar a surrender.
         let decision = tracker.update(windows: windows, at: at, buttonsHidden: hidden,
-                                      keyStates: keyStates, transitionsAreUser: isUserKick)
+                                      keyStates: keyStates, transitionsAreUser: isUserKick,
+                                      reassert: doReassert)
         // Restores before applies: a window the user un-maximized is theirs to have back, and a
         // process that goes busy in the middle then only has the apply deferred.
         for (pid, wids) in decision.restore.sorted(by: { $0.key < $1.key }) {

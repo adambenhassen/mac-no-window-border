@@ -240,6 +240,28 @@ final class WindowTrackerTests: XCTestCase {
                        "the user's switch is a new event, not the flap war that gave up on: back in service")
     }
 
+    func testAFlooredReassertReappliesANonSurrenderedWindow() {
+        // The tab-open case (2026-10-21): iTerm rebuilds its tab-bar titlebar and re-adds the
+        // window decoration — not a focus change and not a key transition, so the timer path never
+        // catches it and a busy app cannot be read. A re-assert cycle asks for the removal again.
+        let tracker = WindowTracker()
+        settle(tracker, [window()], from: 0)
+        assertNothing(tracker.update(windows: [window()], at: 5.0), "a steady window is quiet on a normal cycle")
+        XCTAssertEqual(tracker.update(windows: [window()], at: 6.0, reassert: true).apply, [pid: [1]],
+                       "a re-assert cycle asks for the change again, catching a silent re-decoration")
+    }
+
+    func testAFlooredReassertLeavesASurrenderedWindowAlone() {
+        // A re-assert must not reignite a repaint war the tracker gave up on.
+        let tracker = WindowTracker()
+        settle(tracker, [window()], from: 0)
+        for (at, key) in [(5.0, false), (5.25, true), (5.5, false), (5.75, true), (6.0, false)] {
+            _ = flip(tracker: tracker, at: at, key: key)   // baseline, strikes 1-3, surrender
+        }
+        assertNothing(tracker.update(windows: [window()], at: 6.5, reassert: true),
+                      "a surrendered window is left alone even on a re-assert cycle")
+    }
+
     func testAWindowWithNoReadAnswersNothing() {
         let tracker = WindowTracker()
         settle(tracker, [window()], from: 0)

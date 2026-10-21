@@ -109,8 +109,12 @@ final class ScanLoopTests: XCTestCase {
         ScannedWindow(wid: wid, pid: pid, maximized: maximized)
     }
 
+    /// `reassertInterval` defaults far past any test's clock, so the floored re-assert stays out of
+    /// the cases that are about something else (deferral, buttons, key reads). The re-assert cases
+    /// set a small one of their own.
     private func makeLoop(interval: TimeInterval = 0.25, realClock: Bool = false,
-                          keyReadInterval: TimeInterval = 0) {
+                          keyReadInterval: TimeInterval = 0,
+                          reassertInterval: TimeInterval = 1_000_000) {
         clock = FakeClock()
         scan = FakeScan()
         forward = LogForward()
@@ -123,6 +127,7 @@ final class ScanLoopTests: XCTestCase {
                        engine: engine,
                        buttonsHidden: { [weak self] in self?.hideButtons ?? false },
                        keyReadInterval: keyReadInterval,
+                       reassertInterval: reassertInterval,
                        log: { [weak self] line in self?.logs.append(line) },
                        status: { [weak self] n in self?.statuses.append(n) })
         forward.next = loop.engineLog()
@@ -369,6 +374,23 @@ final class ScanLoopTests: XCTestCase {
                        "a kick does not read: at focus-in the app is busy and the read would time out")
         XCTAssertEqual(engine.calls.filter { !$0.restoring }.count, appliesBefore + 1,
                        "the kick re-asserts the applied window anyway — the repaint has to be answered")
+    }
+
+    func testAFlooredReassertReappliesAppliedWindowsWithNoKeyRead() {
+        // The tab-open fix (2026-10-21): a change an app silently undid — and a busy app the key
+        // read cannot reach — is asked for again on a floored re-assert cycle, which does no read.
+        makeLoop(keyReadInterval: 2, reassertInterval: 1.0)
+        scan.windows = [window()]
+        cycle(at: 0)
+        cycle(at: 0.5)                                   // applied
+        cycle(at: 0.75)                                  // timer path: the one key read
+        let appliesBefore = engine.calls.filter { !$0.restoring }.count
+        let readsBefore = engine.reads.count
+        XCTAssertEqual(readsBefore, 1, "the timer path read once before the re-assert floor passed")
+        cycle(at: 1.6)                                   // past the 1 s re-assert floor
+        XCTAssertEqual(engine.calls.filter { !$0.restoring }.count, appliesBefore + 1,
+                       "the applied window is re-asserted on the floored cycle")
+        XCTAssertEqual(engine.reads.count, readsBefore, "a re-assert cycle does no key read")
     }
 
     func testKickedFocusFlipsKeepTheWindowInService() {
