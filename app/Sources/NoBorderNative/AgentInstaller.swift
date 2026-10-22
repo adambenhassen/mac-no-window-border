@@ -83,6 +83,7 @@ public final class AgentInstaller {
         put(AgentBlob.classGetMethodImpSlot, addresses.classGetMethodImplementation)
         put(AgentBlob.classGetInstanceMethodSlot, addresses.classGetInstanceMethod)
         put(AgentBlob.methodSetImpSlot, addresses.methodSetImplementation)
+        put(AgentBlob.methodGetImpSlot, addresses.methodGetImplementation)
         for (index, value) in addresses.table.enumerated() {
             put(AgentBlob.tableSlot + 8 * index, value)
         }

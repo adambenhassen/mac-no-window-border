@@ -51,6 +51,7 @@ public struct AgentAddresses: Equatable {
     public var classGetMethodImplementation: UInt64
     public var classGetInstanceMethod: UInt64
     public var methodSetImplementation: UInt64
+    public var methodGetImplementation: UInt64
 
     public init(cfmachPortCreate: UInt64, cfmachPortGetPort: UInt64, createRunLoopSource: UInt64,
                 runLoopGetMain: UInt64, runLoopAddSource: UInt64, machMsg: UInt64,
@@ -63,7 +64,8 @@ public struct AgentAddresses: Equatable {
                 runLoopAddTimer: UInt64, cfRunLoopObserverCreate: UInt64,
                 cfRunLoopAddObserver: UInt64, cfRunLoopObserverInvalidate: UInt64,
                 classAddMethod: UInt64, classGetMethodImplementation: UInt64,
-                classGetInstanceMethod: UInt64, methodSetImplementation: UInt64) {
+                classGetInstanceMethod: UInt64, methodSetImplementation: UInt64,
+                methodGetImplementation: UInt64) {
         self.cfmachPortCreate = cfmachPortCreate
         self.cfmachPortGetPort = cfmachPortGetPort
         self.createRunLoopSource = createRunLoopSource
@@ -93,6 +95,7 @@ public struct AgentAddresses: Equatable {
         self.classGetMethodImplementation = classGetMethodImplementation
         self.classGetInstanceMethod = classGetInstanceMethod
         self.methodSetImplementation = methodSetImplementation
+        self.methodGetImplementation = methodGetImplementation
     }
 
     /// All of them, from this process. nil for the first one that does not resolve.
@@ -130,7 +133,8 @@ public struct AgentAddresses: Equatable {
               let classAddMethod = address("class_addMethod"),
               let classGetMethodImplementation = address("class_getMethodImplementation"),
               let classGetInstanceMethod = address("class_getInstanceMethod"),
-              let methodSetImplementation = address("method_setImplementation") else { return nil }
+              let methodSetImplementation = address("method_setImplementation"),
+              let methodGetImplementation = address("method_getImplementation") else { return nil }
         return AgentAddresses(cfmachPortCreate: cfmachPortCreate, cfmachPortGetPort: cfmachPortGetPort,
                               createRunLoopSource: createRunLoopSource, runLoopGetMain: runLoopGetMain,
                               runLoopAddSource: runLoopAddSource, machMsg: machMsg,
@@ -150,7 +154,8 @@ public struct AgentAddresses: Equatable {
                               classAddMethod: classAddMethod,
                               classGetMethodImplementation: classGetMethodImplementation,
                               classGetInstanceMethod: classGetInstanceMethod,
-                              methodSetImplementation: methodSetImplementation)
+                              methodSetImplementation: methodSetImplementation,
+                              methodGetImplementation: methodGetImplementation)
     }
 
     /// The table as it goes into the state page, in the slot order the blob reads it.
@@ -342,6 +347,8 @@ public enum AgentBlob {
     public static let shadowClassTableSlot = 2912        // up to 4 overridden classes (4×8), for teardown
     public static let shadowClassTableCount = 4
     public static let shadowClassTableEnd = shadowClassTableSlot + shadowClassTableCount * 8   // 2944
+    public static let methodGetImpSlot = 2944            // method_getImplementation (installer prefill)
+    public static let nsWindowClassSlot = 2952           // the NSWindow Class (entry-resolved)
 
     public struct Built {
         public var code: [UInt32]
@@ -697,6 +704,10 @@ private extension AgentBlob.Assembler {
               Arc64.ldr(dst: 16, base: 17, offset: tGetClass),
               Arc64.blr(16)])
         branch(.cbz(src: 0, nonzero: false), "failSel")
+        // Keep the NSWindow Class: the observer must never add the override to NSWindow itself
+        // (that would suppress every window in the app), and the IMP guard compares against it.
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 56),
+              Arc64.str(src: 0, base: 17, offset: AgentBlob.nsWindowClassSlot)])
         // class_getMethodImplementation(NSWindowClass, setHasShadow:) → shadowOrig. x0 = the class.
         emit([Arc64.ldr(dst: 17, base: 31, offset: 56),
               Arc64.ldr(dst: 1, base: 17, offset: AgentBlob.selShadowSlot),
@@ -2094,6 +2105,14 @@ private extension AgentBlob.Assembler {
               Arc64.ldr(dst: 16, base: 17, offset: tMsgSend),
               Arc64.blr(16),
               Arc64.str(src: 0, base: 31, offset: 48)])   // cls
+        // Never add the override to NSWindow itself — that would suppress the shadow on every
+        // window in the app, managed or not. (iTerm's windows are subclasses; this guards the
+        // general case and the hostapp's plain windows.)
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 0),
+              Arc64.ldr(dst: 16, base: 17, offset: AgentBlob.nsWindowClassSlot),
+              Arc64.ldr(dst: 0, base: 31, offset: 48),
+              Arc64.cmpReg(lhs: 16, rhs: 0)])
+        branch(.cond(0), "obsShadowDone")   // b.eq: cls == NSWindow — leave it alone
         // Dedup: if cls is already in the override-class table, it is ensured — skip (this is also
         // the per-fire fast path once installed). The scan reads the table through x3.
         emit([Arc64.ldr(dst: 17, base: 31, offset: 0),
@@ -2109,8 +2128,37 @@ private extension AgentBlob.Assembler {
               Arc64.subImmBytes(dst: 9, src: 9, imm: 1)])
         branch(.plain, "obsDedup")
         label("obsInstall")
-        // class_addMethod(cls, setHasShadow:, shadowImp, "v@:B") — ensure cls has its OWN method
-        // (so the next method_setImplementation targets cls, not the inherited NSWindow method).
+        // Table full BEFORE touching the class: if we cannot record it, we must not install it —
+        // teardown only restores recorded classes, so an installed-but-unrecorded class would point
+        // at freed pages after vm_deallocate and crash on its next setHasShadow:. Leave it to the
+        // reactive backstop (no ensured bit).
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 0),
+              Arc64.ldr(dst: 9, base: 17, offset: AgentBlob.shadowClassCountSlot),
+              Arc64.cmpImm(src: 9, imm: AgentBlob.shadowClassTableCount)])
+        branch(.cond(2), "obsShadowDone")   // b.hs: table full — do not install; keep the backstop
+        // IMP guard: install only when cls's current setHasShadow: is NSWindow's inherited IMP (or
+        // our own leftover from a prior teardown). Never clobber a class that defines its own
+        // setHasShadow: (this agent runs in apps other than iTerm). m = class_getInstanceMethod(cls,
+        // setHasShadow:); curImp = method_getImplementation(m).
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 0),
+              Arc64.ldr(dst: 0, base: 31, offset: 48),
+              Arc64.ldr(dst: 1, base: 17, offset: AgentBlob.selShadowSlot),
+              Arc64.ldr(dst: 16, base: 17, offset: AgentBlob.classGetInstanceMethodSlot),
+              Arc64.blr(16),                                     // x0 = Method
+              Arc64.ldr(dst: 17, base: 31, offset: 0),
+              Arc64.ldr(dst: 16, base: 17, offset: AgentBlob.methodGetImpSlot),
+              Arc64.blr(16)])                                    // x0 = curImp
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 0),
+              Arc64.ldr(dst: 16, base: 17, offset: AgentBlob.shadowImpAddrSlot),
+              Arc64.cmpReg(lhs: 0, rhs: 16)])
+        branch(.cond(0), "obsEnsured")   // b.eq: already our IMP — just mark ensured
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 0),
+              Arc64.ldr(dst: 16, base: 17, offset: AgentBlob.shadowOrigSlot),
+              Arc64.cmpReg(lhs: 0, rhs: 16)])
+        branch(.cond(1), "obsShadowDone")   // b.ne: cls has its OWN setHasShadow: — do not touch it
+        // Safe: class_addMethod gives cls its OWN method (so method_setImplementation targets cls,
+        // not the inherited NSWindow method); then force our IMP (reinstall-safe — a prior teardown
+        // left cls's method = NSWindow's IMP, which class_addMethod will not replace).
         emit([Arc64.ldr(dst: 17, base: 31, offset: 0),
               Arc64.ldr(dst: 0, base: 31, offset: 48),
               Arc64.ldr(dst: 1, base: 17, offset: AgentBlob.selShadowSlot),
@@ -2118,10 +2166,6 @@ private extension AgentBlob.Assembler {
               Arc64.addImm(dst: 3, src: 17, imm: AgentBlob.shadowTypesSlot),
               Arc64.ldr(dst: 16, base: 17, offset: AgentBlob.classAddMethodSlot),
               Arc64.blr(16)])
-        // m = class_getInstanceMethod(cls, setHasShadow:); method_setImplementation(m, shadowImp).
-        // Forcing the IMP (not relying on class_addMethod's result) is what makes REINSTALL work:
-        // a prior agent's teardown left cls with an own setHasShadow: (= NSWindow's IMP), so
-        // class_addMethod now answers NO and would otherwise leave the shadow unmanaged.
         emit([Arc64.ldr(dst: 17, base: 31, offset: 0),
               Arc64.ldr(dst: 0, base: 31, offset: 48),
               Arc64.ldr(dst: 1, base: 17, offset: AgentBlob.selShadowSlot),
@@ -2131,13 +2175,10 @@ private extension AgentBlob.Assembler {
               Arc64.ldr(dst: 1, base: 17, offset: AgentBlob.shadowImpAddrSlot),
               Arc64.ldr(dst: 16, base: 17, offset: AgentBlob.methodSetImpSlot),
               Arc64.blr(16)])
-        // Record cls for teardown (restore its IMP before the pages free). Table full → skip the
-        // record (still overridden; a 5th class just won't be restored — bounded by design).
+        // Record cls for teardown (count < 4 guaranteed by the full check above).
         emit([Arc64.ldr(dst: 17, base: 31, offset: 0),
               Arc64.ldr(dst: 9, base: 17, offset: AgentBlob.shadowClassCountSlot),
-              Arc64.cmpImm(src: 9, imm: AgentBlob.shadowClassTableCount)])
-        branch(.cond(2), "obsEnsured")   // b.hs: table full — still overridden, mark the row ensured
-        emit([Arc64.addImm(dst: 3, src: 17, imm: AgentBlob.shadowClassTableSlot),
+              Arc64.addImm(dst: 3, src: 17, imm: AgentBlob.shadowClassTableSlot),
               Arc64.movz(dst: 11, value: 8),
               Arc64.mul(dst: 10, lhs: 9, rhs: 11),   // x10 = count * 8
               Arc64.addReg(dst: 3, lhs: 3, rhs: 10),  // x3 = &table[count]
