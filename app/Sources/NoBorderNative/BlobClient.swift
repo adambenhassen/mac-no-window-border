@@ -180,6 +180,9 @@ public final class BlobClient: @unchecked Sendable {
     /// The installer's refusal reason from the last `ensureAgent` (nil on success), for the
     /// engine's refusal line: which preflight refused is the news.
     public private(set) var lastInstallFailure: String?
+    /// The blob's own `err` from the last install whose entry ran but did not publish ready (nil
+    /// otherwise): the engine tells a refusal that is the process's nature from a busy moment.
+    public private(set) var lastInstallErr: UInt64?
     /// The install's stop budget: the dispatched entry runs as a block on the target's main
     /// QUEUE, and hot-mained apps (Chromium drains it in bursts, measured live 2026-10-21:
     //  `entry-timed-out` at 2 s three for three while a plain parked entry landed in 0.8 ms)
@@ -190,7 +193,9 @@ public final class BlobClient: @unchecked Sendable {
         if let base = agentBase { return base }
         let install = AgentInstaller(task: task).install(pid: UInt64(pid), stopLimit: stopLimit)
         lastInstallFailure = install.failure
+        lastInstallErr = nil
         guard install.failure == nil, let report = install.report, report.ready == 1 else {
+            if install.failure == nil, let report = install.report { lastInstallErr = report.err }
             // The READY boundary (codex review 2026-10-21): the pages existing is not the
             // agent being live — accept only the entry's published ready=1.
             lastInstallFailure = install.failure ?? "entry-not-ready:\(install.report.map { String(describing: $0.result) + "@0x" + String($0.base, radix: 16) } ?? "no-report")"

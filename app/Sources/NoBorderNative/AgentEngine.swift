@@ -26,11 +26,23 @@ public final class AgentEngine: ChangeEngine {
         /// app gets a real chance to drain its queue without the first attempt ever
         /// stalling the scan loop for eight seconds.
         var attempts = 0
+        /// The install refusal is the process's nature, not a moment (`isPermanentRefusal`):
+        /// never retried for this process.
+        var permanentlyRefused = false
         init(_ client: BlobClient, start: UInt64?) { self.client = client; self.start = start }
     }
 
     /// The floor on install retries against a target that refused (seconds).
     private static let installRetryFloor: TimeInterval = 2.0
+
+    /// Whether the blob's `err` from an entry that ran without publishing ready rules the process
+    /// out for its whole life. BOOTSTRAP_NOT_PRIVILEGED (1100): an App-Sandboxed process may not
+    /// `bootstrap_register` (measured 2026-10-21 on new Outlook). Every retry runs the entry again
+    /// and leaves its pages mapped (a run entry is not freed — publication is not transactional),
+    /// so retrying it every floor grew Outlook by ~110 MB in a day (measured 2026-10-22).
+    static func isPermanentRefusal(installErr: UInt64?) -> Bool {
+        installErr == 1100
+    }
 
     /// The kernel's start time for a live pid; nil when the pid is gone.
     private static func procStart(_ pid: pid_t) -> UInt64? {
@@ -153,9 +165,9 @@ public final class AgentEngine: ChangeEngine {
             // killing a working holder over a sysctl hiccup would reinstall an agent whose
             // name is already registered.
             let reused = start != nil && holder.start != start
-            if !reused && holder.base != nil {
+            if !reused && (holder.base != nil || holder.permanentlyRefused) {
                 lock.unlock()
-                return holder    // the healthy case: one client and one agent per process
+                return holder    // one client and one agent (or one final refusal) per process
             }
             // A refused install is a fact about a moment, not the process: a busy target
             // answers `entry-not-parked`/`entry-timed-out` and parks later (measured live
@@ -182,7 +194,10 @@ public final class AgentEngine: ChangeEngine {
         if holder.base == nil {
             installAttempts[pid] = attempt + 1
             holder.failedInstallAt = Self.now()
-            log("engine refused \(pid): agent install refused: \(client.lastInstallFailure ?? "no report")")
+            holder.permanentlyRefused = Self.isPermanentRefusal(installErr: client.lastInstallErr)
+            log("engine refused \(pid): agent install refused: \(client.lastInstallFailure ?? "no report")"
+                + (client.lastInstallErr.map { " err=\($0)" } ?? "")
+                + (holder.permanentlyRefused ? " (sandboxed: not retried)" : ""))
         } else {
             installAttempts.removeValue(forKey: pid)
         }
