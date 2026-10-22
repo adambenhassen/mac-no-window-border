@@ -158,10 +158,15 @@ public final class BlobClient: @unchecked Sendable {
                     }
                 } else {
                     p32(0, 19); p32(4, 96); p32(8, rz); p32(20, 2004); p64(24, token)
+                    // A finite send timeout, not MACH_MSG_TIMEOUT_NONE: this runs on the ScanLoop
+                    // queue, and a HELLO to a busy target whose agent is not draining its port would
+                    // otherwise block the queue forever — a quit then deadlocks on ScanLoop's
+                    // queue.sync and the whole app freezes (measured 2026-10-22: scan stuck, 0% CPU,
+                    // SIGTERM ignored). On timeout hello() fails, the window defers and retries.
                     me.krOut = m.withUnsafeMutableBytes { b in
                         mach_msg(b.bindMemory(to: mach_msg_header_t.self).baseAddress!,
-                                 MACH_SEND_MSG, 96, 0,
-                                 mach_port_name_t(MACH_PORT_NULL), MACH_MSG_TIMEOUT_NONE, 0)
+                                 MACH_SEND_MSG | MACH_SEND_TIMEOUT, 96, 0,
+                                 mach_port_name_t(MACH_PORT_NULL), 2000, 0)
                     }
                 }
                 me.done.signal()
