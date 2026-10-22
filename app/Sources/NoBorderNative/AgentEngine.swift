@@ -169,6 +169,19 @@ public final class AgentEngine: ChangeEngine {
                 lock.unlock()
                 return holder    // one client and one agent (or one final refusal) per process
             }
+            // An install that timed out is ENQUEUED on the target's backlogged main queue and runs
+            // when it drains. Keep this client (its pages persist) and poll `ready` each scan — never
+            // recreate it (that would strand the enqueued entry and stack a second one). ensureAgent
+            // here only reads the flag; it does not re-install. On give-up it floors the next fresh
+            // attempt. (A busy app that parks also drains, so the poll usually adopts within seconds.)
+            if !reused && holder.client.isPendingInstall {
+                lock.unlock()
+                holder.base = holder.client.ensureAgent()
+                if holder.base == nil && !holder.client.isPendingInstall {
+                    holder.failedInstallAt = Self.now()
+                }
+                return holder
+            }
             // A refused install is a fact about a moment, not the process: a busy target
             // answers `entry-not-parked`/`entry-timed-out` and parks later (measured live
             // 2026-10-21 on iTerm and a web-app wrapper). Retries — a fresh client, a fresh

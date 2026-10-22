@@ -250,6 +250,20 @@ if start reclaim; then
   finish
 fi
 
+if start async; then
+  # Async-adopt: a tiny stop budget forces the install to time out (entry enqueued, not yet run);
+  # the client keeps the pages, reports pending, and a later poll adopts once the entry has run —
+  # then an op confirms the adopted agent is live. This is the busy-target (Vivaldi) path.
+  open m obs
+  if ./build/noborder-probe agent-async $HP ${W[m]} > $out/async.out 2>&1; then
+    r=$(grep -o 'sawPending=[a-z]*' $out/async.out)
+    check "async-adopt timed out, then adopted + applied" "$r" "sawPending=true"
+  else
+    bad "async-adopt: $(cat $out/async.out)"
+  fi
+  finish
+fi
+
 pkill -f 'tests/hostapp' 2>/dev/null
 [[ $fail -eq 0 ]] && echo "obsedge: ALL PASS" || echo "obsedge: FAILURES"
 exit $fail

@@ -331,6 +331,31 @@ case "agent-planted-apply":
     _ = instA.remove(pid: UInt64(pid), base: rep.base)
     mach_port_mod_refs(mach_task_self_, reply, MACH_PORT_RIGHT_RECEIVE, -1)
     exit(status == 1 ? 0 : 1)
+case "agent-async":
+    // Prove the async-adopt lifecycle for a backlogged target: a tiny stop budget forces the first
+    // install to time out (the entry is enqueued but not yet run), BlobClient keeps the pages and
+    // reports pending, and a later poll adopts once the deferred entry has run. Then an op confirms
+    // the adopted agent is live. args: <pid> <wid>.
+    guard args.count > 3, let awid = UInt32(args[3]) else { fail("agent-async wants <pid> <wid>") }
+    guard let client = BlobClient(pid: pid) else { fail("agent-async \(pid): no task port") }
+    let first = client.ensureAgent(stopLimit: 0.0)   // deadline already passed: deterministic timeout
+    let sawPending = first == nil && client.isPendingInstall
+    var base = first
+    var polls = 0
+    while base == nil && client.isPendingInstall && polls < 100 {
+        usleep(50_000)
+        base = client.ensureAgent()
+        polls += 1
+    }
+    print("agent-async \(pid) first=\(first.map { "0x" + String($0, radix: 16) } ?? "nil") "
+          + "sawPending=\(sawPending) polls=\(polls) "
+          + "adopted=\(base.map { "0x" + String($0, radix: 16) } ?? "nil") "
+          + "failure=\(client.lastInstallFailure ?? "nil")")
+    guard let adopted = base else { fail("agent-async \(pid): never adopted") }
+    let st = client.op(apply: true, wid: awid)
+    print("agent-async \(pid) op status=\(st.map { String(describing: $0) } ?? "nil(\(client.lastOpStage ?? "?"))")")
+    client.removeAgent(base: adopted)
+    exit(st == .applied ? 0 : 1)
 case "agent-ping":
     // P1a-0 (kept for the record): the extract-right handoff is DEAD on macOS 15 —
     // mach_port_extract_right on a target-allocated name returns KERN_INVALID_CAPITAL (18),

@@ -162,7 +162,18 @@ public final class AgentInstaller {
             // blob's pages stay mapped and protected: they are not the executor's to release.
             return (report, nil)
         }
-        // The entry never ran: nothing published, nothing named, so the pages can go.
+        if result == .timedOut {
+            // The target's main queue is backlogged (a busy Electron app): the dispatched entry is
+            // ENQUEUED and WILL run later, when the queue drains, and set `ready`. Freeing the pages
+            // (or dropping the planted channel) now would make that deferred run touch freed memory.
+            // Keep both; `ensureAgent` polls `ready` and adopts the agent once the entry has run,
+            // instead of re-installing (which would stack a second enqueued entry). The pages are
+            // never freed for a timed-out install — a late entry could still run — so a give-up
+            // leaks them (bounded: one region per target that never drains).
+            return (report, "entry-timed-out")
+        }
+        // The entry never started (not parked) or failed before enqueue: nothing is queued, nothing
+        // published, so the pages can go.
         dropPlant()
         vm_deallocate(task.port, address, vm_size_t(AgentBlob.regionBytes))
         return (report, "entry-\(describe(result))")

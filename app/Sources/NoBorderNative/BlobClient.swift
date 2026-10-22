@@ -197,6 +197,21 @@ public final class BlobClient: @unchecked Sendable {
     /// instead of HELLO + bootstrap lookup.
     private var planted = false
     private var plantedCtrlSend: mach_port_name_t = 0
+    /// A timed-out install whose dispatched entry is still ENQUEUED on a backlogged target's main
+    /// queue (a busy Electron app). It runs when the queue drains; we keep the pages and poll `ready`
+    /// on later scans, then adopt — rather than re-installing, which would stack another enqueued
+    /// entry. A give-up leaks the pages (a late entry could still run into them), bounded to one
+    /// region per target that never drains.
+    private var pending: (base: UInt64, service: String, planted: Bool,
+                          ctrlSend: mach_port_name_t, err: UInt64?)?
+    private var pendingPolls = 0
+    private static let maxPendingPolls = 40   // ~40 scans (≥40 s) for the queue to drain, then give up
+    /// Whether an enqueued install is still being polled: the engine keeps this client (and its
+    /// pages) across scans instead of recreating it, so the poll can see the entry finally run.
+    public var isPendingInstall: Bool { pending != nil }
+    private func ready(at base: UInt64) -> Bool {
+        task.readWord(at: base &+ UInt64(AgentBlob.pageSize + AgentBlob.readySlot)) == 1
+    }
     /// The installer's refusal reason from the last `ensureAgent` (nil on success), for the
     /// engine's refusal line: which preflight refused is the news.
     public private(set) var lastInstallFailure: String?
@@ -211,6 +226,29 @@ public final class BlobClient: @unchecked Sendable {
     @discardableResult
     public func ensureAgent(stopLimit: TimeInterval = 2.0) -> UInt64? {
         if let base = agentBase { return base }
+        // Poll a timed-out install: its entry was enqueued on a backlogged target and may have run
+        // since. Adopt when `ready` is published; never re-install while polling (that stacks
+        // entries); give up after a bound, leaking the pages (a late entry could still run).
+        if let p = pending {
+            if ready(at: p.base) {
+                agentBase = p.base
+                planted = p.planted
+                plantedCtrlSend = p.ctrlSend
+                if p.planted { sendRemote = p.ctrlSend } else { rzService = p.service }
+                pending = nil
+                lastInstallFailure = nil
+                return p.base
+            }
+            pendingPolls += 1
+            if pendingPolls >= Self.maxPendingPolls {
+                lastInstallErr = p.err
+                lastInstallFailure = "pending-giveup"
+                pending = nil
+                return nil
+            }
+            lastInstallFailure = "pending"
+            return nil
+        }
         // Test hook: force the planted (sandbox) rendezvous against a non-sandboxed target, which
         // would otherwise take the bootstrap path on its first install. Offline proof only.
         if ProcessInfo.processInfo.environment["NOBORDER_FORCE_PLANT"] != nil {
@@ -235,6 +273,14 @@ public final class BlobClient: @unchecked Sendable {
             rzService = report.serviceName
             return report.base
         }
+        // Busy target: the entry is enqueued but has not run within the budget. Keep the pages and
+        // poll `ready` on later scans; do not re-install.
+        if let report = install.report, report.result == .timedOut {
+            pending = (report.base, report.serviceName, false, 0, nil)
+            pendingPolls = 0
+            lastInstallFailure = "pending"
+            return nil
+        }
         // Sandboxed target (blob err 1100 = BOOTSTRAP_NOT_PRIVILEGED): the bootstrap rendezvous can
         // never complete. Retry with a controller-planted receive port (CFMachPortCreateWithPort, no
         // bootstrap). iTerm and other non-sandboxed apps never reach this — their first install is
@@ -247,6 +293,14 @@ public final class BlobClient: @unchecked Sendable {
                 plantedCtrlSend = pr.ctrlSend
                 sendRemote = pr.ctrlSend
                 return pr.base
+            }
+            // Planted entry enqueued on a backlogged sandboxed target: keep the pages + the planted
+            // send and poll, like the bootstrap case.
+            if let pr = planted.report, pr.result == .timedOut, pr.ctrlSend != 0 {
+                pending = (pr.base, pr.serviceName, true, pr.ctrlSend, 1100)
+                pendingPolls = 0
+                lastInstallFailure = "pending"
+                return nil
             }
             // Couldn't plant either — still a sandboxed give-up: keep err 1100 so the engine marks
             // it permanent (no retry spam / page leak, the reason for the permanent-refusal rule).
