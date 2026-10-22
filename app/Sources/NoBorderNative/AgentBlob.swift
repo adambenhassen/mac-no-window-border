@@ -349,6 +349,7 @@ public enum AgentBlob {
     public static let shadowClassTableEnd = shadowClassTableSlot + shadowClassTableCount * 8   // 2944
     public static let methodGetImpSlot = 2944            // method_getImplementation (installer prefill)
     public static let nsWindowClassSlot = 2952           // the NSWindow Class (entry-resolved)
+    public static let selWindowNumberSlot = 2960         // windowNumber (the IMP's stale-row guard)
 
     public struct Built {
         public var code: [UInt32]
@@ -426,9 +427,10 @@ public enum AgentBlob {
                         // selCount preflight loop) — the observer's post-reapply flush selectors.
                         "invalidateShadow", "displayIfNeeded",
                         // P1f: the `class` selector (to get a window's real class, not the KVO
-                        // subclass object_getClass would return) and the NSWindow class name (whose
-                        // setHasShadow: IMP is the override's tail-call target).
-                        "class", "NSWindow"]
+                        // subclass object_getClass would return), the NSWindow class name (whose
+                        // setHasShadow: IMP is the override's tail-call target), and `windowNumber`
+                        // (the override IMP's guard against a stale, address-reused row).
+                        "class", "NSWindow", "windowNumber"]
         var namesBlock = [UInt8]()
         for name in selNames {
             var bytes = Array(name.utf8)
@@ -715,8 +717,19 @@ private extension AgentBlob.Assembler {
               Arc64.blr(16)])
         branch(.cbz(src: 0, nonzero: false), "failSel")
         emit([Arc64.ldr(dst: 17, base: 31, offset: 56),
-              Arc64.str(src: 0, base: 17, offset: AgentBlob.shadowOrigSlot),
-              // x0 held the IMP; the code below addresses state through x0. Restore it.
+              Arc64.str(src: 0, base: 17, offset: AgentBlob.shadowOrigSlot)])
+        // Resolve `windowNumber` (index 20) → selWindowNumberSlot (the IMP's stale-row guard).
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 56),
+              Arc64.ldr(dst: 1, base: 17, offset: AgentBlob.selNameCursorSlot),
+              Arc64.addImmBytes(dst: 1, src: 1, imm: 32),   // "NSWindow" -> "windowNumber"
+              Arc64.str(src: 1, base: 17, offset: AgentBlob.selNameCursorSlot),
+              Arc64.movReg(dst: 0, src: 1),
+              Arc64.ldr(dst: 16, base: 17, offset: tSelReg),
+              Arc64.blr(16)])
+        branch(.cbz(src: 0, nonzero: false), "failSel")
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 56),
+              Arc64.str(src: 0, base: 17, offset: AgentBlob.selWindowNumberSlot),
+              // x0 held the SEL; the code below addresses state through x0. Restore it.
               Arc64.ldr(dst: 0, base: 31, offset: 56)])
         // task_get_special_port(mach_task_self_, 4 /* BOOTSTRAP_PORT */, &state.bs) — three
         // arguments (measured 2026-10-20: with x0=state passed as the target task, the kernel
@@ -2380,33 +2393,68 @@ private extension AgentBlob.Assembler {
     /// managed window's class. Called by the ObjC runtime with x0=self, x1=_cmd, w2=flag — a method
     /// IMP gets NO context pointer, so the state-page base is baked into the first four words (a
     /// movImm64 placeholder the installer patches). If `self` is one of our applied windows (op==1
-    /// in the op table), it forces the flag to NO so iTerm's `setHasShadow:YES` never turns the
-    /// shadow on — the only flash-free fix (a reactive removal always loses one frame to the window
-    /// server). Then it TAIL-CALLS (`br`, no frame) NSWindow's original IMP, so unmanaged windows
-    /// (and managed ones, now with flag NO) behave normally. A leaf that writes only caller-saved
-    /// registers; teardown restores this method to the original IMP before the pages are freed.
+    /// in the op table) AND its live windowNumber still matches the row's wid, it forces the flag to
+    /// NO so iTerm's `setHasShadow:YES` never turns the shadow on — the only flash-free fix (a
+    /// reactive removal always loses one frame to the window server). The windowNumber check guards
+    /// the case where a closed window's address was reused by a new window (object-identity match,
+    /// different window): the new window keeps its shadow. Then it restores x0-x2 and TAIL-CALLS
+    /// (`br`) NSWindow's original IMP, so unmanaged windows (and managed ones, now with flag NO)
+    /// behave normally. Writes only caller-saved registers + the saved frame pair; teardown restores
+    /// this method to the original IMP before the pages are freed.
+    ///
+    /// Frame 64: self@0, _cmd@8, flag@16, state@24, rowWid@32, pair@48. The state base is saved so
+    /// it survives the windowNumber msgSend (x17 is ABI scratch across a call).
     mutating func assembleShadowImp() {
-        // x17 = the state-page base (installer-patched movImm64 — MUST be the first four words).
+        // x17 = the state-page base (installer-patched movImm64 — MUST be the first four words,
+        // before the prologue; the prologue does not touch x17).
         emit(Arc64.movImm64(dst: 17, value: 0))
+        emit([Arc64.subImm(dst: 31, src: 31, imm: 64),
+              Arc64.stp(dst: 29, dst2: 30, base: 31, offset: 48),
+              Arc64.addImm(dst: 29, src: 31, imm: 48),
+              Arc64.str(src: 0, base: 31, offset: 0),       // self
+              Arc64.str(src: 1, base: 31, offset: 8),       // _cmd
+              Arc64.str(src: 2, base: 31, offset: 16),      // flag
+              Arc64.str(src: 17, base: 31, offset: 24)])    // state base (reloaded after the call)
         emit([Arc64.movz(dst: 9, value: UInt16(AgentBlob.opTableCount)),
               Arc64.movz(dst: 10, value: UInt16(AgentBlob.opTableSlot)),
               Arc64.addReg(dst: 10, lhs: 10, rhs: 17)])   // x10 = state + opTableSlot (row cursor)
         label("shScan")
         emit([Arc64.ldr(dst: 11, base: 10, offset: AgentBlob.rowObject),
+              Arc64.ldr(dst: 0, base: 31, offset: 0),       // self
               Arc64.cmpReg(lhs: 11, rhs: 0)])
-        branch(.cond(1), "shSkip")   // b.ne: not this window
+        branch(.cond(1), "shNext")   // b.ne: not this window
         emit([Arc64.ldr(dst: 11, base: 10, offset: AgentBlob.rowOp),
               Arc64.cmpImm(src: 11, imm: 1)])
-        branch(.cond(0), "shForce")  // b.eq: an applied row for self — suppress the shadow
-        label("shSkip")
+        branch(.cond(1), "shNext")   // b.ne: not an applied row (a restore row must pass through)
+        // Object identity matched — confirm it is still the same window by number (guards an
+        // address reused by a new window). rowWid is stashed; the msgSend clobbers x10/x11/x16/x17.
+        emit([Arc64.ldr(dst: 11, base: 10, offset: AgentBlob.rowWid),
+              Arc64.str(src: 11, base: 31, offset: 32),     // rowWid
+              Arc64.ldr(dst: 17, base: 31, offset: 24),     // state
+              Arc64.ldr(dst: 0, base: 31, offset: 0),       // self
+              Arc64.ldr(dst: 1, base: 17, offset: AgentBlob.selWindowNumberSlot),
+              Arc64.ldr(dst: 16, base: 17, offset: tMsgSend),
+              Arc64.blr(16),                                // x0 = [self windowNumber]
+              Arc64.ldr(dst: 11, base: 31, offset: 32),     // rowWid
+              Arc64.cmpReg(lhs: 0, rhs: 11)])
+        branch(.cond(1), "shDone")   // b.ne: same address, different window — pass through
+        // Confirmed our window: force the flag to NO.
+        emit([Arc64.strZero(base: 31, offset: 16)])         // flag = NO
+        branch(.plain, "shDone")
+        label("shNext")
         emit([Arc64.addImmBytes(dst: 10, src: 10, imm: AgentBlob.opEntryBytes),
               Arc64.subImmBytes(dst: 9, src: 9, imm: 1)])
         branch(.cbz(src: 9, nonzero: true), "shScan")
-        branch(.plain, "shDone")     // scanned all rows, no match — pass the flag through
-        label("shForce")
-        emit([Arc64.movz(dst: 2, value: 0)])   // flag = NO
         label("shDone")
-        emit([Arc64.ldr(dst: 16, base: 17, offset: AgentBlob.shadowOrigSlot),
+        // Restore the ObjC arguments (flag may now be NO), tear the frame down, tail-call the
+        // original NSWindow setHasShadow:.
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 24),     // state
+              Arc64.ldr(dst: 0, base: 31, offset: 0),       // self
+              Arc64.ldr(dst: 1, base: 31, offset: 8),       // _cmd
+              Arc64.ldr(dst: 2, base: 31, offset: 16),      // flag
+              Arc64.ldr(dst: 16, base: 17, offset: AgentBlob.shadowOrigSlot),
+              Arc64.ldp(dst: 29, dst2: 30, base: 31, offset: 48),
+              Arc64.addImm(dst: 31, src: 31, imm: 64),
               Arc64.br(16)])   // tail-call NSWindow's setHasShadow:(self, _cmd, flag)
     }
 }

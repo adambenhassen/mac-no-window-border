@@ -276,10 +276,11 @@ final class AgentBlobTests: XCTestCase {
         // and the class-table cursor.
         audit(built.code[built.observerOff / 4..<built.observerOff / 4 + built.observerWordCount],
               label: "observer", storeBases: [31, 17, 2, 3], loadBases: [31, 17, 2, 3])
-        // The setHasShadow: override IMP (P1f): a leaf that stores nothing and tail-calls (no ret);
-        // loads come from the op-table row cursor (x10) and the state page (x17).
+        // The setHasShadow: override IMP (P1f): a framed function that tail-calls (no ret). Stores
+        // land on its frame (31 — self/_cmd/flag/state/rowWid); loads come from the frame, the
+        // op-table row cursor (x10), and the state page (x17).
         audit(built.code[built.shadowImpOff / 4..<built.shadowImpOff / 4 + built.shadowImpWordCount],
-              label: "shadowImp", storeBases: [], loadBases: [10, 17])
+              label: "shadowImp", storeBases: [31], loadBases: [10, 17, 31])
     }
 
     /// The observer is the real regression re-removal, not a stub: it reads the `hasShadow` gate
