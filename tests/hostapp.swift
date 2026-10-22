@@ -32,12 +32,22 @@ import AppKit
 import Darwin   // task_get_bootstrap_port (mach/task_special_ports.h), bootstrap_register (bootstrap.h)
 
 let app = NSApplication.shared
-app.setActivationPolicy(.accessory)
+// The border-observer test (obsreg) needs a regular, activated, key window from the start.
+let isObsreg = CommandLine.arguments.contains("obsreg")
+app.setActivationPolicy(isObsreg ? .regular : .accessory)
 let usable = NSScreen.screens[0].visibleFrame
 
+// obsreg's windows are an NSWindow SUBCLASS that does not implement setHasShadow:, so the agent's
+// class_addMethod override lands (a plain NSWindow implements it, so class_addMethod would fail —
+// iTerm's window is likewise a subclass that inherits setHasShadow:).
+final class ObsWindow: NSWindow {}
+
 func makeWindow(_ name: String, _ frame: NSRect) -> NSWindow {
-    let w = NSWindow(contentRect: frame, styleMask: [.titled, .closable, .resizable, .miniaturizable],
-                     backing: .buffered, defer: false)
+    let w: NSWindow = isObsreg
+        ? ObsWindow(contentRect: frame, styleMask: [.titled, .closable, .resizable, .miniaturizable],
+                    backing: .buffered, defer: false)
+        : NSWindow(contentRect: frame, styleMask: [.titled, .closable, .resizable, .miniaturizable],
+                   backing: .buffered, defer: false)
     w.title = name
     w.appearance = NSAppearance(named: .darkAqua)
     w.backgroundColor = NSColor(white: 0.05, alpha: 1)
@@ -48,8 +58,15 @@ func makeWindow(_ name: String, _ frame: NSRect) -> NSWindow {
 }
 
 let small = NSRect(x: usable.minX + 200, y: usable.minY + 150, width: 600, height: 400)
-let maxWindow = makeWindow("max", CommandLine.arguments.contains("small") ? small : usable)
-let floating = makeWindow("floating", NSRect(x: usable.minX + 100, y: usable.minY + 100, width: 400, height: 300))
+// obsreg uses the small frame: a full-screen window's natural drawsDecorationView is 0 (a
+// maximized window has no decoration — the project's premise), so it can't be held at 1 to
+// simulate a regression; a small window's natural value is 1 and holds what the test sets.
+let maxIsSmall = CommandLine.arguments.contains("small") || CommandLine.arguments.contains("obsreg")
+let maxWindow = makeWindow("max", maxIsSmall ? small : usable)
+// obsreg keeps a single window: a second ordered window destabilises the decoration read.
+if !CommandLine.arguments.contains("obsreg") {
+    _ = makeWindow("floating", NSRect(x: usable.minX + 100, y: usable.minY + 100, width: 400, height: 300))
+}
 var idInfo = thread_identifier_info()
 var idCount = mach_msg_type_number_t(MemoryLayout<thread_identifier_info>.size / MemoryLayout<integer_t>.size)
 withUnsafeMutablePointer(to: &idInfo) { p in p.withMemoryRebound(to: integer_t.self, capacity: Int(idCount)) {
@@ -61,12 +78,17 @@ var sources: [DispatchSourceSignal] = []
 var tickTimer: DispatchSourceTimer?   // kept here: a source that goes out of scope is released and stops firing
 var churnTimer: DispatchSourceTimer?
 var spinCount = 0   // written by the "spin" mode below, so the loop around it cannot be optimized out
-for (sig, frame) in [(SIGUSR1, small), (SIGUSR2, usable)] {
-    signal(sig, SIG_IGN)
-    let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
-    source.setEventHandler { maxWindow.setFrame(frame, display: true) }
-    source.resume()
-    sources.append(source)
+// The "obsreg" mode (tests/obsflash.sh) takes SIGUSR1/SIGUSR2 for the border-observer test, so
+// the shared resize handlers step aside there — resizing max would realize a new titlebar and
+// muddy the decoration read.
+if !CommandLine.arguments.contains("obsreg") {
+    for (sig, frame) in [(SIGUSR1, small), (SIGUSR2, usable)] {
+        signal(sig, SIG_IGN)
+        let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+        source.setEventHandler { maxWindow.setFrame(frame, display: true) }
+        source.resume()
+        sources.append(source)
+    }
 }
 for (sig, focus) in [(SIGCONT, true), (SIGWINCH, false)] {
     signal(sig, SIG_IGN)
@@ -427,6 +449,38 @@ if let ai = CommandLine.arguments.firstIndex(of: "agent") {
     }
     print("agent service \(rzService) register kr \(krReg) (rz port \(rz), krRz \(krRz))")
     fflush(stdout)
+}
+
+var obsregSources: [DispatchSourceSignal] = []
+var obsOther: NSWindow?
+if CommandLine.arguments.contains("obsreg") {
+    // The border-observer / setHasShadow:-override offline proof (tests/obsflash.sh). The vehicle
+    // is hasShadow: iTerm re-enables the window shadow when it redraws its border on a tab switch
+    // (measured 2026-10-22), so the agent gates its observer on hasShadow AND installs a
+    // setHasShadow: override that forces NO on managed windows (the zero-flash fix). SIGUSR1 sets
+    // hasShadow=true on BOTH max (managed) and `other` (a same-class window NOT applied), then
+    // reads both back SYNCHRONOUSLY — so a `max=0` proves the OVERRIDE forced it at the setter
+    // (not the observer, which runs later), and `other=1` proves non-managed windows keep shadows.
+    // SIGUSR2 reports the current values.
+    NSApp.activate(ignoringOtherApps: true)
+    maxWindow.makeKeyAndOrderFront(nil)
+    let other = makeWindow("other", NSRect(x: usable.minX + 900, y: usable.minY + 150, width: 500, height: 350))
+    obsOther = other
+    func line(_ tag: String) { print("\(tag) max=\(maxWindow.hasShadow ? 1 : 0) other=\(other.hasShadow ? 1 : 0)"); fflush(stdout) }
+    signal(SIGUSR1, SIG_IGN)
+    let setSrc = DispatchSource.makeSignalSource(signal: SIGUSR1, queue: .main)
+    setSrc.setEventHandler {
+        maxWindow.hasShadow = true
+        other.hasShadow = true
+        line("shadow set")   // synchronous read-back: the override (if installed) already forced max to NO
+    }
+    setSrc.resume()
+    obsregSources.append(setSrc)
+    signal(SIGUSR2, SIG_IGN)
+    let readSrc = DispatchSource.makeSignalSource(signal: SIGUSR2, queue: .main)
+    readSrc.setEventHandler { line("shadow now") }
+    readSrc.resume()
+    obsregSources.append(readSrc)
 }
 
 if CommandLine.arguments.contains("restoreobs") {
