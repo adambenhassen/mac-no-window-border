@@ -2,8 +2,10 @@ import Darwin
 import Foundation
 import NoBorderEngine
 
-/// The loop that changes windows: scan, settle, ask the engine — every 250 ms, on one serial
-/// queue, and immediately when the app is kicked by a focus change (`kick`).
+/// The loop that changes windows: scan, settle, ask the engine — every second, on one serial
+/// queue, and immediately when the app is kicked by a focus change (`kick`). The border no longer
+/// rides this cadence: the in-agent observer and the setHasShadow: override handle it event-driven,
+/// so the scan only has to notice new/closed windows and silent re-decorations, not race a flash.
 ///
 /// This is the app's daemon: the scanner and the engine are in the same process, so there is no child
 /// to supervise, no `status:` pipe to read, and no reason for the scan to be slower than the settle
@@ -65,7 +67,7 @@ public final class ScanLoop {
     /// changes, and not four times a second while it does not.
     private static let perBatch = ["skipped (not parked)"]
 
-    public init(interval: TimeInterval = 0.25,
+    public init(interval: TimeInterval = 1.0,
                 now: @escaping Clock = { Date().timeIntervalSince1970 },
                 scan: @escaping Scan,
                 tracker: WindowTracker = WindowTracker(),

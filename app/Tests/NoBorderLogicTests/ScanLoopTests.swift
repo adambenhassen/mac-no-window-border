@@ -4,7 +4,7 @@ import NoBorderEngine
 import XCTest
 @testable import NoBorderLogic
 
-/// The 250 ms loop, with a fake scan, a fake clock and a fake engine: what a cycle asks for, what a
+/// The scan loop, with a fake scan, a fake clock and a fake engine: what a cycle asks for, what a
 /// stop leaves behind, that a deferral is asked again, that cycles never overlap, and what reaches
 /// the log. The scanner and the real engine are the app's, and are driven by tests/e2e.sh.
 final class ScanLoopTests: XCTestCase {
@@ -139,7 +139,7 @@ final class ScanLoopTests: XCTestCase {
         loop.step()
     }
 
-    /// Cycles at the shipped 250 ms cadence, over a stretch of the fake clock.
+    /// Cycles at a fixed cadence, over a stretch of the fake clock.
     private func cycles(from: TimeInterval, to: TimeInterval) {
         var t = from
         while t <= to + 1e-9 {

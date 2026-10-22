@@ -92,7 +92,7 @@ final class EngineManager: ObservableObject {
         if on { start() } else { stop() }
     }
 
-    /// The buttons option takes effect on the next scan (≤250 ms): the loop reads it fresh every
+    /// The buttons option takes effect on the next scan (≤1 s): the loop reads it fresh every
     /// cycle, and an applied window that disagrees with it is applied again with the new value.
     func setHideButtons(_ on: Bool) {
         hideButtons = on
@@ -130,7 +130,7 @@ final class EngineManager: ObservableObject {
         newLoop.start()
         // A focus change is the moment an app repaints its decorations over our change, and
         // NSWorkspace says when one happens — in-process, no polling. The loop's cycle, kicked at
-        // that moment, puts the change back in milliseconds; the 250 ms scan stays the floor for
+        // that moment, puts the change back in milliseconds; the 1 s scan stays the floor for
         // everything else.
         activation = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
