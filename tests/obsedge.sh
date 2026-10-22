@@ -224,6 +224,32 @@ if start rows; then
   finish
 fi
 
+if start reclaim; then
+  # A force-kill leaves a prior agent's override wired into a class (teardown never ran). A fresh
+  # agent must RECOGNIZE that leftover (by the agent magic before its IMP) and reclaim it, not skip
+  # it as a foreign setHasShadow:. Simulate with two agents in one host: A installs the override,
+  # then B installs WITHOUT A being uninstalled, and must reclaim (shadowClassCount=1).
+  open m obs
+  install && {
+    op apply m
+    sleep 1
+    check "agent A forces NO" "$(shadow set m 1)" 0
+    SVC_A=$SVC; BASE_A=$BASE
+    install && {                       # agent B, A still resident (its override stranded on the class)
+      op apply m
+      sleep 1
+      scc=$($probe agent-dump $HP $BASE | grep -o 'shadowClassCount=0x[0-9a-f]*')
+      check "agent B reclaimed the leftover override" "$scc" "shadowClassCount=0x1"
+      check "still forced NO after reclaim" "$(shadow set m 1)" 0
+      $probe agent-uninstall $HP $BASE > /dev/null 2>&1     # B restores the method
+    }
+    $probe agent-uninstall $HP $BASE_A > /dev/null 2>&1
+    check "after both removed, shadow settable" "$(shadow set m 1)" 1
+    alive
+  }
+  finish
+fi
+
 pkill -f 'tests/hostapp' 2>/dev/null
 [[ $fail -eq 0 ]] && echo "obsedge: ALL PASS" || echo "obsedge: FAILURES"
 exit $fail

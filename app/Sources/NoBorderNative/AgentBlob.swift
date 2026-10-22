@@ -431,7 +431,11 @@ public enum AgentBlob {
         let timerOff = (cbOff + cb.bytes + 15) / 16 * 16
         let observerOff = (timerOff + timer.bytes + 15) / 16 * 16
         let teardownOff = (observerOff + observer.bytes + 15) / 16 * 16
-        let shadowImpOff = (teardownOff + teardown.bytes + 15) / 16 * 16
+        // The +8 reserves one 8-byte word immediately before the 16-aligned IMP entry for the agent
+        // MAGIC marker. The observer's install guard reads [IMP-8] to recognize a setHasShadow:
+        // override left by ANY NoBorder instance (ours or a prior one a force-kill stranded) and
+        // reclaim it, instead of mistaking it for a foreign app's own setHasShadow: and skipping.
+        let shadowImpOff = (teardownOff + teardown.bytes + 8 + 15) / 16 * 16
         let prefix = Array(namePrefix.utf8) + [0]
         // The P1b selector names, 32 bytes each in slot order (selWindowSlot up), the class
         // name last. The entry resolves them once; the strings are RX code-page data.
@@ -475,6 +479,12 @@ public enum AgentBlob {
         let teardownWords = teardown.resolve()
         code.append(contentsOf: teardownWords)
         code.append(contentsOf: [UInt32](repeating: 0, count: shadowImpOff / 4 - code.count))
+        // The agent magic, as the 8 bytes immediately before the IMP entry (little-endian, matching
+        // the state page's magicSlot). The install guard reads [IMP-8] and compares it to the blob's
+        // own magic to recognize a NoBorder override from any instance. Data, not code — placed in
+        // the padding before shadowImpOff, so the audited IMP range (shadowImpOff onward) is clean.
+        code[shadowImpOff / 4 - 2] = UInt32(truncatingIfNeeded: magic)
+        code[shadowImpOff / 4 - 1] = UInt32(truncatingIfNeeded: magic >> 32)
         let shadowImpWords = shadowImp.resolve()
         code.append(contentsOf: shadowImpWords)
         let pad = (8 - code.count * 4 % 8) % 8
@@ -2285,7 +2295,18 @@ private extension AgentBlob.Assembler {
         emit([Arc64.ldr(dst: 17, base: 31, offset: 0),
               Arc64.ldr(dst: 16, base: 17, offset: AgentBlob.shadowOrigSlot),
               Arc64.cmpReg(lhs: 0, rhs: 16)])
-        branch(.cond(1), "obsShadowDone")   // b.ne: cls has its OWN setHasShadow: — do not touch it
+        branch(.cond(0), "obsDoInstall")   // b.eq: NSWindow's inherited IMP — install over it
+        // Not inherited, not our current IMP: is it a NoBorder override left by a PRIOR instance (a
+        // force-kill/crash strands it — teardown never ran)? Such an IMP carries the agent magic in
+        // the 8 bytes before its entry. If so, reclaim it (force our live IMP); else it is a foreign
+        // app's own setHasShadow: — leave it alone. Reading [curImp-8] stays inside that method's
+        // code page (our stranded IMP, or — vanishingly rare — a foreign method not at a page start).
+        emit([Arc64.subImmBytes(dst: 1, src: 0, imm: 8),
+              Arc64.ldr(dst: 1, base: 1, offset: 0),        // the 8 bytes before curImp
+              Arc64.ldr(dst: 16, base: 17, offset: AgentBlob.magicSlot),
+              Arc64.cmpReg(lhs: 1, rhs: 16)])
+        branch(.cond(1), "obsShadowDone")   // b.ne: foreign setHasShadow: — do not touch it
+        label("obsDoInstall")
         // Safe: class_addMethod gives cls its OWN method (so method_setImplementation targets cls,
         // not the inherited NSWindow method); then force our IMP (reinstall-safe — a prior teardown
         // left cls's method = NSWindow's IMP, which class_addMethod will not replace).

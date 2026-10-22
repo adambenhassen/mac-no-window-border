@@ -276,7 +276,9 @@ final class AgentBlobTests: XCTestCase {
         // and the class-table cursor (x3); loads come from the frame, the state page, the row cursor,
         // and the class-table cursor.
         audit(built.code[built.observerOff / 4..<built.observerOff / 4 + built.observerWordCount],
-              label: "observer", storeBases: [31, 17, 2, 3], loadBases: [31, 17, 2, 3])
+        // x1 is also a load base: the install guard reads [curImp-8] (the magic before a leftover
+        // override's IMP) through x1 to recognize and reclaim a NoBorder override from any instance.
+              label: "observer", storeBases: [31, 17, 2, 3], loadBases: [31, 17, 2, 3, 1])
         // The setHasShadow: override IMP (P1f): a framed function that tail-calls (no ret). Stores
         // land on its frame (31 — self/_cmd/flag/state/rowWid/row) and the op-table row (x10 — the
         // app's recorded request); loads come from the frame, the row cursor (x10), and the state
@@ -398,6 +400,23 @@ final class AgentBlobTests: XCTestCase {
                       "initRow clears the reused row's stale object identity")
         XCTAssertTrue(cb.contains { $0 == Arc64.strZero(base: 2, offset: AgentBlob.rowAppShadow) },
                       "initRow clears the reused row's stale app-shadow request")
+    }
+
+    /// Leftover reclaim: the agent magic sits in the 8 bytes immediately before the setHasShadow:
+    /// IMP entry, and the observer's install guard reads [curImp-8] (through x1) and compares it to
+    /// the blob magic — so an override left by a prior instance (force-kill, no teardown) is
+    /// recognized and reclaimed instead of skipped as foreign.
+    func testOverrideCarriesMagicAndGuardReadsIt() {
+        let built = AgentBlob.build(pid: 41)
+        XCTAssertEqual(built.code[built.shadowImpOff / 4 - 2], UInt32(truncatingIfNeeded: AgentBlob.magic),
+                       "magic low word precedes the IMP")
+        XCTAssertEqual(built.code[built.shadowImpOff / 4 - 1], UInt32(truncatingIfNeeded: AgentBlob.magic >> 32),
+                       "magic high word precedes the IMP")
+        let obs = built.code[built.observerOff / 4..<built.observerOff / 4 + built.observerWordCount]
+        XCTAssertTrue(obs.contains(Arc64.subImmBytes(dst: 1, src: 0, imm: 8)), "guard computes curImp-8")
+        XCTAssertTrue(obs.contains(Arc64.ldr(dst: 1, base: 1, offset: 0)), "guard reads the word before curImp")
+        XCTAssertTrue(obs.contains(Arc64.ldr(dst: 16, base: 17, offset: AgentBlob.magicSlot)),
+                      "guard loads the blob magic to compare")
     }
 
     /// Sandbox rendezvous: the planted-port slot and the CFMachPortCreateWithPort slot are fresh,
