@@ -265,11 +265,11 @@ final class AgentBlobTests: XCTestCase {
         // loads come from the frame, state, and the mode-pointer dereference (x16).
         audit(built.code[built.timerOff / 4..<built.timerOff / 4 + built.timerWordCount],
               label: "timer", storeBases: [31, 17], loadBases: [31, 17, 16])
-        // The teardown subroutine (P1d/P1e/P1f): stores land on the frame (31 — state base and the
-        // P1f restore-loop index); loads come from the frame, the state page (x17), and the
-        // override-class table cursor (x2). (It also restores the setHasShadow: override.)
+        // The teardown subroutine (P1d/P1e/P1f): stores land on the frame (31 — state base, the
+        // P1f restore-loop index, the Method) and the state page (x17 — the kept-pages flag); loads
+        // come from the frame, the state page (x17), and the override-class table cursor (x2).
         audit(built.code[built.teardownOff / 4..<built.teardownOff / 4 + built.teardownWordCount],
-              label: "teardown", storeBases: [31], loadBases: [31, 17, 2])
+              label: "teardown", storeBases: [31, 17], loadBases: [31, 17, 2])
         // The border observer (P1e/P1f): stores land on the frame (31), the state page (x17 — depth
         // counter and the override-class table count), the row cursor (x2 — the ensured flag bit),
         // and the class-table cursor (x3); loads come from the frame, the state page, the row cursor,
@@ -277,10 +277,11 @@ final class AgentBlobTests: XCTestCase {
         audit(built.code[built.observerOff / 4..<built.observerOff / 4 + built.observerWordCount],
               label: "observer", storeBases: [31, 17, 2, 3], loadBases: [31, 17, 2, 3])
         // The setHasShadow: override IMP (P1f): a framed function that tail-calls (no ret). Stores
-        // land on its frame (31 — self/_cmd/flag/state/rowWid); loads come from the frame, the
-        // op-table row cursor (x10), and the state page (x17).
+        // land on its frame (31 — self/_cmd/flag/state/rowWid/row) and the op-table row (x10 — the
+        // app's recorded request); loads come from the frame, the row cursor (x10), and the state
+        // page (x17).
         audit(built.code[built.shadowImpOff / 4..<built.shadowImpOff / 4 + built.shadowImpWordCount],
-              label: "shadowImp", storeBases: [31], loadBases: [10, 17, 31])
+              label: "shadowImp", storeBases: [31, 10], loadBases: [10, 17, 31])
     }
 
     /// The observer is the real regression re-removal, not a stub: it reads the `hasShadow` gate
@@ -302,6 +303,49 @@ final class AgentBlobTests: XCTestCase {
         XCTAssertTrue(setsDecoration, "the observer re-applies setDrawsDecorationView:")
         XCTAssertTrue(setsShadow, "the observer re-applies setHasShadow:")
         XCTAssertGreaterThanOrEqual(calls, 4, "the observer resolves app/window/titlebar + gate + setters via msgSend")
+    }
+
+    /// Whether `words` holds an `ldr`/`str` at `offset` through a base in `bases` (any data register).
+    private func touches(_ words: ArraySlice<UInt32>, offset: Int, store: Bool, bases: Set<Int>) -> Bool {
+        words.contains { word in
+            guard let d = decode(word), d.name == (store ? "str" : "ldr"), let base = d.base,
+                  bases.contains(base) else { return false }
+            return Int((word >> 10) & 0xFFF) * 8 == offset
+        }
+    }
+
+    /// Review #5: the teardown does not restore blind. It compares the IMP method_setImplementation
+    /// replaced with our override; anything else is a swizzle stacked on ours (whose saved original is
+    /// our IMP), so it is put back and `keepPagesSlot` is set for the installer to skip the free.
+    func testTeardownKeepsPagesUnderAStackedSwizzle() {
+        let built = AgentBlob.build(pid: 13)
+        let words = built.code[built.teardownOff / 4..<built.teardownOff / 4 + built.teardownWordCount]
+        XCTAssertTrue(touches(words, offset: AgentBlob.shadowImpAddrSlot, store: false, bases: [17]),
+                      "the teardown compares the replaced IMP with our override")
+        XCTAssertTrue(touches(words, offset: AgentBlob.keepPagesSlot, store: true, bases: [17]),
+                      "the teardown flags kept pages")
+        XCTAssertGreaterThanOrEqual(AgentBlob.keepPagesSlot, AgentBlob.selWindowNumberSlot + 8)
+        XCTAssertLessThan(AgentBlob.keepPagesSlot + 8, AgentBlob.pageSize)
+    }
+
+    /// Review #6: the override records the app's own setHasShadow: request (only at depth 0 — our
+    /// own apply/backstop calls run at depth > 0) in the row, and the op path's restore reads it.
+    func testOverrideRecordsAppIntentAndRestoreUsesIt() {
+        let built = AgentBlob.build(pid: 17)
+        let imp = built.code[built.shadowImpOff / 4..<built.shadowImpOff / 4 + built.shadowImpWordCount]
+        XCTAssertTrue(touches(imp, offset: AgentBlob.depthSlot, store: false, bases: [17]),
+                      "the override records only outside our own mutations")
+        XCTAssertTrue(touches(imp, offset: AgentBlob.rowAppShadow, store: true, bases: Set(0...16)),
+                      "the override records the request in the row")
+        let cb = built.code[built.cbOff / 4..<built.cbOff / 4 + built.cbWordCount]
+        XCTAssertTrue(touches(cb, offset: AgentBlob.rowAppShadow, store: false, bases: [3]),
+                      "the restore reads the recorded request")
+        let rowFields = [AgentBlob.rowWid, AgentBlob.rowOp, AgentBlob.rowButtons, AgentBlob.rowDesiredGen,
+                         AgentBlob.rowDoneGen, AgentBlob.rowLastStatus, AgentBlob.rowFlags, AgentBlob.rowObject,
+                         AgentBlob.rowOrigShadow, AgentBlob.rowOrigRadius, AgentBlob.rowOrigButton0,
+                         AgentBlob.rowOrigButton1, AgentBlob.rowOrigButton2, AgentBlob.rowOrigDecoration]
+        XCTAssertFalse(rowFields.contains(AgentBlob.rowAppShadow), "rowAppShadow overlaps a row field")
+        XCTAssertLessThanOrEqual(AgentBlob.rowAppShadow + 8, AgentBlob.opEntryBytes)
     }
 
     /// The digits cursor stores live in the entry (`strb …, [x4, #8]`, `strb …, [x8]`); they are

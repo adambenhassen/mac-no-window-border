@@ -134,6 +134,8 @@ public final class AgentInstaller {
     /// completion flag — the run loop can no longer schedule the callback — deallocate the
     /// blob's pages. A fault inside the block resumes at the block epilogue (the dispatched
     /// mode's guard path); the pages then stay mapped, which is the safe half of the failure.
+    /// The pages also stay when the teardown found a swizzle stacked on the setHasShadow: override
+    /// (`keepPagesSlot`): that swizzle calls our IMP as its original, so freeing would crash the app.
     public func remove(pid: UInt64, base: UInt64) -> (result: RunResult, stopNanoseconds: Int, failure: String?) {
         guard let addresses = AddressTable.current() else { return (.failed("remove-preflight"), 0,"no-exec-addresses") }
         guard let main = task.mainThread() else { return (.failed("remove-preflight"), 0,"no-main-thread") }
@@ -142,6 +144,9 @@ public final class AgentInstaller {
         let (result, stop) = executor.run(script, on: main, addresses: addresses,
                                           stopLimit: 2.0, enterLimit: 2.0)
         guard result == .ok else { return (result, stop, "remove-\(describe(result))") }
+        // An unreadable flag is not evidence the pages are unreferenced: keep them.
+        let keep = task.readWord(at: base &+ UInt64(AgentBlob.pageSize + AgentBlob.keepPagesSlot))
+        guard keep == 0 else { return (.ok, stop, keep == nil ? "kept-pages-unreadable" : "kept-pages-stacked-swizzle") }
         let kr = vm_deallocate(task.port, vm_address_t(base), vm_size_t(AgentBlob.regionBytes))
         return (.ok, stop, kr == KERN_SUCCESS ? nil : "vm_deallocate kr=\(kr)")
     }
