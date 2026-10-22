@@ -35,6 +35,11 @@ public final class BlobClient: @unchecked Sendable {
     fileprivate var opGen: UInt64 = 0
     fileprivate var opWid: UInt64 = 0
     fileprivate var opButtons: UInt64 = 0
+    /// Planted (sandbox) op: carry a reply port and session 0; the bootstrap op carries no reply
+    /// port (the agent keeps its HELLO-registered port) and the HELLO token as the session.
+    fileprivate var opPlanted = false
+    fileprivate var opReply: mach_port_name_t = 0
+    fileprivate var opSession: UInt64 = 0
     fileprivate var sendRemote: mach_port_name_t = 0   // warm-up: loopback; sends: the agent
     fileprivate var agentRemote: mach_port_name_t = 0
     fileprivate let toolService: String
@@ -72,6 +77,7 @@ public final class BlobClient: @unchecked Sendable {
     deinit {
         mach_port_deallocate(mach_task_self_, toolRcv)
         if rzSend != 0 { mach_port_deallocate(mach_task_self_, rzSend) }
+        if plantedCtrlSend != 0 { mach_port_deallocate(mach_task_self_, plantedCtrlSend) }
     }
 
     /// Resolve the agent's rendezvous name: installed agents register it in the target's
@@ -139,8 +145,12 @@ public final class BlobClient: @unchecked Sendable {
                 func p32(_ at: Int, _ v: UInt32) { for i in 0..<4 { m[at + i] = UInt8((v >> (8 * i)) & 0xff) } }
                 func p64(_ at: Int, _ v: UInt64) { for i in 0..<8 { m[at + i] = UInt8((v >> (8 * i)) & 0xff) } }
                 if isOp {
-                    p32(0, 19); p32(4, 64); p32(8, rz); p32(20, opId)
-                    p64(24, gen); p64(32, wid); p64(40, UInt64(mode)); p64(48, buttons); p64(56, token)
+                    // Planted: bits 0x1413 (remote COPY_SEND, local MAKE_SEND) + the reply port at
+                    // 12, so the agent ACKs back to us; bootstrap: bits 19, no reply port.
+                    let bits: UInt32 = me.opPlanted ? 0x1413 : 19
+                    p32(0, bits); p32(4, 64); p32(8, rz); p32(20, opId)
+                    if me.opPlanted { p32(12, me.opReply) }
+                    p64(24, gen); p64(32, wid); p64(40, UInt64(mode)); p64(48, buttons); p64(56, me.opSession)
                     me.krOut = m.withUnsafeMutableBytes { b in
                         mach_msg(b.bindMemory(to: mach_msg_header_t.self).baseAddress!,
                                  MACH_SEND_MSG | MACH_SEND_TIMEOUT, 64, 0,
@@ -177,6 +187,11 @@ public final class BlobClient: @unchecked Sendable {
     /// Install the agent once per process; answers the pages' base for removal (the
     /// installer owns them; `removeAgent` frees them).
     private var agentBase: UInt64?
+    /// Sandbox rendezvous: set when the agent was installed with a controller-planted port (a
+    /// sandboxed target that could not bootstrap_register). `op()` then drives the planted channel
+    /// instead of HELLO + bootstrap lookup.
+    private var planted = false
+    private var plantedCtrlSend: mach_port_name_t = 0
     /// The installer's refusal reason from the last `ensureAgent` (nil on success), for the
     /// engine's refusal line: which preflight refused is the news.
     public private(set) var lastInstallFailure: String?
@@ -191,19 +206,54 @@ public final class BlobClient: @unchecked Sendable {
     @discardableResult
     public func ensureAgent(stopLimit: TimeInterval = 2.0) -> UInt64? {
         if let base = agentBase { return base }
+        // Test hook: force the planted (sandbox) rendezvous against a non-sandboxed target, which
+        // would otherwise take the bootstrap path on its first install. Offline proof only.
+        if ProcessInfo.processInfo.environment["NOBORDER_FORCE_PLANT"] != nil {
+            let planted = AgentInstaller(task: task).install(pid: UInt64(pid), stopLimit: stopLimit, plantPort: true)
+            lastInstallFailure = planted.failure
+            if planted.failure == nil, let pr = planted.report, pr.ready == 1, pr.ctrlSend != 0 {
+                agentBase = pr.base
+                self.planted = true
+                plantedCtrlSend = pr.ctrlSend
+                sendRemote = pr.ctrlSend
+                return pr.base
+            }
+            lastInstallErr = planted.report?.err
+            lastInstallFailure = planted.failure ?? "planted-entry-not-ready"
+            return nil
+        }
         let install = AgentInstaller(task: task).install(pid: UInt64(pid), stopLimit: stopLimit)
         lastInstallFailure = install.failure
         lastInstallErr = nil
-        guard install.failure == nil, let report = install.report, report.ready == 1 else {
-            if install.failure == nil, let report = install.report { lastInstallErr = report.err }
-            // The READY boundary (codex review 2026-10-21): the pages existing is not the
-            // agent being live — accept only the entry's published ready=1.
-            lastInstallFailure = install.failure ?? "entry-not-ready:\(install.report.map { String(describing: $0.result) + "@0x" + String($0.base, radix: 16) } ?? "no-report")"
+        if install.failure == nil, let report = install.report, report.ready == 1 {
+            agentBase = report.base
+            rzService = report.serviceName
+            return report.base
+        }
+        // Sandboxed target (blob err 1100 = BOOTSTRAP_NOT_PRIVILEGED): the bootstrap rendezvous can
+        // never complete. Retry with a controller-planted receive port (CFMachPortCreateWithPort, no
+        // bootstrap). iTerm and other non-sandboxed apps never reach this — their first install is
+        // ready, so their proven path is untouched.
+        if install.failure == nil, install.report?.err == 1100 {
+            let planted = AgentInstaller(task: task).install(pid: UInt64(pid), stopLimit: stopLimit, plantPort: true)
+            if planted.failure == nil, let pr = planted.report, pr.ready == 1, pr.ctrlSend != 0 {
+                agentBase = pr.base
+                self.planted = true
+                plantedCtrlSend = pr.ctrlSend
+                sendRemote = pr.ctrlSend
+                return pr.base
+            }
+            // Couldn't plant either — still a sandboxed give-up: keep err 1100 so the engine marks
+            // it permanent (no retry spam / page leak, the reason for the permanent-refusal rule).
+            lastInstallErr = 1100
+            lastInstallFailure = planted.failure ?? "planted-entry-not-ready"
             return nil
         }
-        agentBase = report.base
-        rzService = report.serviceName
-        return report.base
+        if let report = install.report { lastInstallErr = report.err }
+        // The READY boundary (codex review 2026-10-21): the pages existing is not the
+        // agent being live — accept only the entry's published ready=1.
+        lastInstallFailure = install.failure ?? "entry-not-ready:\(install.report.map { String(describing: $0.result) + "@0x" + String($0.base, radix: 16) } ?? "no-report")"
+        return nil
     }
 
     /// Register this session with the agent (HELLO + the COMPLEX handshake).
@@ -241,9 +291,19 @@ public final class BlobClient: @unchecked Sendable {
     /// One op, answered by its gen-matched ACK. nil = no answer; `.deferred` is a real answer:
     /// the row is pending in the agent and self-completes through the wake timer (P1c).
     public func op(apply: Bool, wid: UInt32, buttons: UInt64 = 0) -> Status? {
-        // hello() names its own failure stage (connect, send kr, handshake kr, handshake
-        // shape); do not overwrite it here.
-        guard hello() else { return nil }
+        // Planted (sandbox) agents have no HELLO session: send straight over the planted channel
+        // with our receive port as the reply (the blob ACKs there), session 0. Bootstrap agents
+        // register the session with HELLO first (hello() names its own failure stage).
+        if planted {
+            sendRemote = plantedCtrlSend
+            opPlanted = true
+            opReply = toolRcv
+            opSession = 0
+        } else {
+            guard hello() else { return nil }
+            opPlanted = false
+            opSession = helloToken
+        }
         let gen = UInt64(clock_gettime_nsec_np(CLOCK_UPTIME_RAW))
         sendBytes = [UInt8](repeating: 0, count: 64)
         isOp = true
