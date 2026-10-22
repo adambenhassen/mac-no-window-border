@@ -52,6 +52,8 @@ public struct AgentAddresses: Equatable {
     public var classGetInstanceMethod: UInt64
     public var methodSetImplementation: UInt64
     public var methodGetImplementation: UInt64
+    /// Sandbox rendezvous: wraps a controller-planted receive right (out of `table`).
+    public var cfMachPortCreateWithPort: UInt64
 
     public init(cfmachPortCreate: UInt64, cfmachPortGetPort: UInt64, createRunLoopSource: UInt64,
                 runLoopGetMain: UInt64, runLoopAddSource: UInt64, machMsg: UInt64,
@@ -65,7 +67,7 @@ public struct AgentAddresses: Equatable {
                 cfRunLoopAddObserver: UInt64, cfRunLoopObserverInvalidate: UInt64,
                 classAddMethod: UInt64, classGetMethodImplementation: UInt64,
                 classGetInstanceMethod: UInt64, methodSetImplementation: UInt64,
-                methodGetImplementation: UInt64) {
+                methodGetImplementation: UInt64, cfMachPortCreateWithPort: UInt64) {
         self.cfmachPortCreate = cfmachPortCreate
         self.cfmachPortGetPort = cfmachPortGetPort
         self.createRunLoopSource = createRunLoopSource
@@ -96,6 +98,7 @@ public struct AgentAddresses: Equatable {
         self.classGetInstanceMethod = classGetInstanceMethod
         self.methodSetImplementation = methodSetImplementation
         self.methodGetImplementation = methodGetImplementation
+        self.cfMachPortCreateWithPort = cfMachPortCreateWithPort
     }
 
     /// All of them, from this process. nil for the first one that does not resolve.
@@ -134,7 +137,8 @@ public struct AgentAddresses: Equatable {
               let classGetMethodImplementation = address("class_getMethodImplementation"),
               let classGetInstanceMethod = address("class_getInstanceMethod"),
               let methodSetImplementation = address("method_setImplementation"),
-              let methodGetImplementation = address("method_getImplementation") else { return nil }
+              let methodGetImplementation = address("method_getImplementation"),
+              let cfMachPortCreateWithPort = address("CFMachPortCreateWithPort") else { return nil }
         return AgentAddresses(cfmachPortCreate: cfmachPortCreate, cfmachPortGetPort: cfmachPortGetPort,
                               createRunLoopSource: createRunLoopSource, runLoopGetMain: runLoopGetMain,
                               runLoopAddSource: runLoopAddSource, machMsg: machMsg,
@@ -155,7 +159,8 @@ public struct AgentAddresses: Equatable {
                               classGetMethodImplementation: classGetMethodImplementation,
                               classGetInstanceMethod: classGetInstanceMethod,
                               methodSetImplementation: methodSetImplementation,
-                              methodGetImplementation: methodGetImplementation)
+                              methodGetImplementation: methodGetImplementation,
+                              cfMachPortCreateWithPort: cfMachPortCreateWithPort)
     }
 
     /// The table as it goes into the state page, in the slot order the blob reads it.
@@ -357,6 +362,15 @@ public enum AgentBlob {
     /// swizzler's saved original is our IMP, so the pages must outlive the agent (the installer skips
     /// vm_deallocate and reports it). A small leak beats a jump into freed memory.
     public static let keepPagesSlot = 2968
+    /// Sandbox rendezvous: the target-space RECEIVE port name the controller allocated in the target
+    /// and planted here before the entry ran. When non-zero the entry wraps it with
+    /// CFMachPortCreateWithPort instead of creating a new port + bootstrap_register (a sandboxed app
+    /// may not register — err 1100). 0 → the bootstrap path (the fallback). Fresh slot (past
+    /// keepPagesSlot); rzName stays for the fallback.
+    public static let plantedPortSlot = 2976
+    /// CFMachPortCreateWithPort, installer-prefilled (out of the 22-entry function table, like the
+    /// P1e/P1f functions, so cbAddrSlot=240 and the offsets below it do not move).
+    public static let cfMachPortCreateWithPortSlot = 2984
 
     public struct Built {
         public var code: [UInt32]
@@ -739,10 +753,20 @@ private extension AgentBlob.Assembler {
               Arc64.str(src: 0, base: 17, offset: AgentBlob.selWindowNumberSlot),
               // x0 held the SEL; the code below addresses state through x0. Restore it.
               Arc64.ldr(dst: 0, base: 31, offset: 56)])
+        // Sandbox rendezvous: when the controller planted a receive right (plantedPort != 0), wrap
+        // it with CFMachPortCreateWithPort — no bootstrap port, no service name, no register, so a
+        // sandboxed app (which may not bootstrap_register — err 1100) comes up live. Otherwise the
+        // bootstrap path runs: get the task's bootstrap port, create a fresh CFMachPort, register
+        // its name. Both converge at portMade (the CFMachPort in [sp,48]).
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 56),
+              Arc64.ldr(dst: 16, base: 17, offset: AgentBlob.plantedPortSlot),
+              Arc64.cmpImm(src: 16, imm: 0)])
+        branch(.cond(1), "plantedCreate")   // b.ne: a port was planted
         // task_get_special_port(mach_task_self_, 4 /* BOOTSTRAP_PORT */, &state.bs) — three
         // arguments (measured 2026-10-20: with x0=state passed as the target task, the kernel
         // answers MACH_SEND_INVALID_DEST 0x10000003). The state base comes back from the frame.
-        emit([Arc64.ldr(dst: 16, base: 0, offset: tTgs),
+        emit([Arc64.ldr(dst: 0, base: 31, offset: 56),
+              Arc64.ldr(dst: 16, base: 0, offset: tTgs),
               Arc64.ldr(dst: 17, base: 0, offset: tSelf),
               Arc64.ldr(dst: 0, base: 17, offset: 0),
               Arc64.movz(dst: 1, value: 4),
@@ -762,6 +786,21 @@ private extension AgentBlob.Assembler {
               Arc64.blr(16),
               Arc64.cmpImm(src: 0, imm: 0)])
         branch(.cond(0), "failNull")
+        branch(.plain, "portMade")
+        // Planted path: CFMachPortCreateWithPort(NULL, plantedName, cbAddr, &ctx, &available) wraps
+        // the controller's receive right. Same context and callback as the bootstrap create.
+        label("plantedCreate")
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 56),
+              Arc64.ldr(dst: 16, base: 17, offset: AgentBlob.cfMachPortCreateWithPortSlot),
+              Arc64.movz(dst: 0, value: 0),
+              Arc64.ldr(dst: 1, base: 17, offset: AgentBlob.plantedPortSlot),
+              Arc64.ldr(dst: 2, base: 17, offset: AgentBlob.cbAddrSlot),
+              Arc64.addImm(dst: 3, src: 31, imm: 0),
+              Arc64.addImm(dst: 4, src: 31, imm: 40),
+              Arc64.blr(16),
+              Arc64.cmpImm(src: 0, imm: 0)])
+        branch(.cond(0), "failNull")
+        label("portMade")
         emit([Arc64.str(src: 0, base: 31, offset: 48),
               // x17 is scratch across calls (measured 2026-10-20: a store through the
               // create-clobbered x17 wrote 0x1f143b888 and faulted) — reload after every call.
@@ -775,6 +814,12 @@ private extension AgentBlob.Assembler {
               // port; CFMachPortInvalidate takes the port).
               Arc64.ldr(dst: 0, base: 31, offset: 48),
               Arc64.str(src: 0, base: 17, offset: AgentBlob.machPortRefSlot)])
+        // Planted path: the channel already exists (the controller holds the send), so skip the
+        // service name and bootstrap_register entirely — straight to adding the run-loop source.
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 56),
+              Arc64.ldr(dst: 16, base: 17, offset: AgentBlob.plantedPortSlot),
+              Arc64.cmpImm(src: 16, imm: 0)])
+        branch(.cond(1), "portSource")   // b.ne: planted — no name, no register
         // No self-insert on the CFMachPort name: `CFMachPortGetPort` answers a plain send right
         // (measured 2026-10-20: its `mach_port_type` is 0x10000 = SEND, no rights), and a
         // MAKE_SEND insert on it is `KERN_INVALID_RIGHT` (17). The linked agent P1a-0 shipped
@@ -845,6 +890,7 @@ private extension AgentBlob.Assembler {
               Arc64.cmpImm(src: 0, imm: 0)])
         branch(.cond(1), "failMP")
         // Published: source last, so every checked failure above leaves the run loop untouched.
+        label("portSource")
         emit([Arc64.ldr(dst: 17, base: 31, offset: 56),
               Arc64.ldr(dst: 16, base: 17, offset: tSource),
               Arc64.movz(dst: 0, value: 0),

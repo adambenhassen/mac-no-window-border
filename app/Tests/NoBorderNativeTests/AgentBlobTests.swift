@@ -400,6 +400,23 @@ final class AgentBlobTests: XCTestCase {
                       "initRow clears the reused row's stale app-shadow request")
     }
 
+    /// Sandbox rendezvous: the planted-port slot and the CFMachPortCreateWithPort slot are fresh,
+    /// 8-aligned, inside the state page, and distinct from the override slots; the function resolves
+    /// and stays out of the 22-entry table (so cbAddrSlot and the offsets below it do not move).
+    func testPlantedPortSlotsAndAddress() throws {
+        let slots = [AgentBlob.plantedPortSlot, AgentBlob.cfMachPortCreateWithPortSlot]
+        for slot in slots {
+            XCTAssertGreaterThanOrEqual(slot, AgentBlob.keepPagesSlot + 8, "slot \(slot) collides")
+            XCTAssertEqual(slot % 8, 0, "slot \(slot) not 8-aligned")
+            XCTAssertLessThan(slot + 8, AgentBlob.pageSize, "slot \(slot) overruns the state page")
+        }
+        XCTAssertEqual(Set(slots).count, slots.count)
+        guard let a = AgentAddresses.current() else { throw XCTSkip("no agent addresses") }
+        XCTAssertNotEqual(a.cfMachPortCreateWithPort, 0)
+        XCTAssertEqual(a.table.count, 22, "the function table must not grow")
+        XCTAssertFalse(a.table.contains(a.cfMachPortCreateWithPort))
+    }
+
     /// The digits cursor stores live in the entry (`strb …, [x4, #8]`, `strb …, [x8]`); they are
     /// cursors over the state page. The entry audit above admits the state base directly; this
     /// pins the cursor stores' existence — the audit would pass a build that never wrote them.

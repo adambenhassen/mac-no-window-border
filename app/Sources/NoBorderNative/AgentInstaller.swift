@@ -30,13 +30,22 @@ public final class AgentInstaller {
         /// the client looks THIS up, not the pid convention: the old registration outlives
         /// removal, so the name is a per-install fact, not a per-pid one.
         public var serviceName: String
+        /// Sandbox rendezvous: a controller-space SEND right to the blob's planted receive port,
+        /// 0 when planting failed (the blob then used the bootstrap path). The client holds it to
+        /// drive ops without a bootstrap lookup.
+        public var ctrlSend: mach_port_t = 0
     }
 
     public init(task: TargetTask) { self.task = task }
 
     /// nil on success; the reason it refused — always before the target was touched, except the
     /// listed post-entry failures, which are the blob's own answers.
-    public func install(pid: UInt64, forceFault: Bool = false, stopLimit: TimeInterval = 2.0)
+    /// `plantPort` opts into the bootstrap-free rendezvous: the controller plants a receive right in
+    /// the target and the blob wraps it instead of registering a name (the only path for a sandboxed
+    /// app). Default off keeps the bootstrap path — the shipped clients and test harnesses rely on it
+    /// until they move to the planted channel.
+    public func install(pid: UInt64, forceFault: Bool = false, stopLimit: TimeInterval = 2.0,
+                        plantPort: Bool = false)
         -> (report: Report?, failure: String?) {
         // Resolve everything before touching the target: a blob we cannot finish is a blob we
         // never started (verdict 5's build order).
@@ -84,8 +93,35 @@ public final class AgentInstaller {
         put(AgentBlob.classGetInstanceMethodSlot, addresses.classGetInstanceMethod)
         put(AgentBlob.methodSetImpSlot, addresses.methodSetImplementation)
         put(AgentBlob.methodGetImpSlot, addresses.methodGetImplementation)
+        put(AgentBlob.cfMachPortCreateWithPortSlot, addresses.cfMachPortCreateWithPort)
         for (index, value) in addresses.table.enumerated() {
             put(AgentBlob.tableSlot + 8 * index, value)
+        }
+        // Sandbox rendezvous: allocate a RECEIVE right in the target and extract a SEND to ourselves,
+        // giving the blob a channel with no bootstrap (a sandboxed app may not bootstrap_register —
+        // err 1100). Plant the target-space receive name; the entry wraps it (CFMachPortCreateWithPort)
+        // when it is non-zero. A failure here is not fatal: plantedPort stays 0 and the entry falls
+        // back to the bootstrap path.
+        var ctrlSend: mach_port_t = 0
+        var plantedName: mach_port_name_t = 0
+        if plantPort, mach_port_allocate(task.port, MACH_PORT_RIGHT_RECEIVE, &plantedName) == KERN_SUCCESS {
+            var extracted: mach_port_t = 0
+            var extractedType: mach_msg_type_name_t = 0
+            if mach_port_extract_right(task.port, plantedName,
+                                       mach_msg_type_name_t(MACH_MSG_TYPE_MAKE_SEND),
+                                       &extracted, &extractedType) == KERN_SUCCESS {
+                ctrlSend = extracted
+                put(AgentBlob.plantedPortSlot, UInt64(plantedName))
+            } else {
+                mach_port_destroy(task.port, plantedName)   // no send extracted — drop the receive
+            }
+        }
+        // Drop the planted channel when an install fails before the agent goes live (on success the
+        // send lives on in Report for the client; the receive right stays with the live blob).
+        func dropPlant() {
+            guard ctrlSend != 0 else { return }
+            mach_port_deallocate(mach_task_self_, ctrlSend)
+            mach_port_destroy(task.port, plantedName)
         }
         var code = blob.code
         let movWords = Arc64.movImm64(dst: 17, value: base &+ UInt64(AgentBlob.pageSize))
@@ -97,6 +133,7 @@ public final class AgentInstaller {
         // OS already relies on: cross-task `vm_write` pages execute coherently (the shipped
         // executor's whole test history; the entry's first ping ACK is this install's proof).
         guard write(code, at: base), write(state, at: base &+ UInt64(AgentBlob.pageSize)) else {
+            dropPlant()
             vm_deallocate(task.port, address, vm_size_t(AgentBlob.regionBytes))
             return (nil, "vm_write failed")
         }
@@ -105,6 +142,7 @@ public final class AgentInstaller {
         let stateProtect = vm_protect(task.port, address &+ vm_address_t(AgentBlob.pageSize),
                                       vm_size_t(AgentBlob.pageSize), 0, VM_PROT_READ | VM_PROT_WRITE)
         guard codeProtect == KERN_SUCCESS, stateProtect == KERN_SUCCESS else {
+            dropPlant()
             vm_deallocate(task.port, address, vm_size_t(AgentBlob.regionBytes))
             return (nil, "vm_protect kr=\(codeProtect)/\(stateProtect)")
         }
@@ -118,13 +156,14 @@ public final class AgentInstaller {
                             ready: task.readWord(at: stateBase &+ UInt64(AgentBlob.readySlot)),
                             err: task.readWord(at: stateBase &+ UInt64(AgentBlob.errSlot)),
                             base: base, stopNanoseconds: stop,
-                            serviceName: namePrefix + String(pid))
+                            serviceName: namePrefix + String(pid), ctrlSend: ctrlSend)
         if result == .ok || result == .faulted {
             // The thread is back with the app — the install is over, in both directions. The
             // blob's pages stay mapped and protected: they are not the executor's to release.
             return (report, nil)
         }
         // The entry never ran: nothing published, nothing named, so the pages can go.
+        dropPlant()
         vm_deallocate(task.port, address, vm_size_t(AgentBlob.regionBytes))
         return (report, "entry-\(describe(result))")
     }
@@ -149,6 +188,12 @@ public final class AgentInstaller {
         guard keep == 0 else { return (.ok, stop, keep == nil ? "kept-pages-unreadable" : "kept-pages-stacked-swizzle") }
         let kr = vm_deallocate(task.port, vm_address_t(base), vm_size_t(AgentBlob.regionBytes))
         return (.ok, stop, kr == KERN_SUCCESS ? nil : "vm_deallocate kr=\(kr)")
+    }
+
+    /// One state slot, read back from the target (the sandbox-rendezvous proof reads the callback
+    /// counter and the planted-port slot).
+    public func readSlot(base: UInt64, _ slot: Int) -> UInt64? {
+        task.readWord(at: base &+ UInt64(AgentBlob.pageSize + slot))
     }
 
     /// The state page's named slots, read back from the target (debug: shows how far the entry

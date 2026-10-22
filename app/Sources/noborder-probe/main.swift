@@ -239,6 +239,49 @@ case "agent-addrs":
     guard let exec = AddressTable.current(), let agent = AgentAddresses.current() else { fail("agent-addrs \(pid) no-addresses") }
     print("exec: " + Mirror(reflecting: exec).children.map { "\($0.label ?? "?")=" + String(format: "%016x", $0.value as! UInt64) }.joined(separator: " "))
     print("agent: " + agent.table.map { String(format: "%016x", $0) }.joined(separator: " "))
+case "agent-install-planted":
+    // Sandbox rendezvous proof: install with a controller-planted receive port (no bootstrap), then
+    // ping the blob over the extracted send right and confirm the blob's callback counter advances —
+    // proving the planted channel delivers. This verifies the load-bearing primitive (allocate a
+    // receive right in the target, extract MAKE_SEND → kr 0) end to end.
+    let installP = AgentInstaller(task: task).install(pid: UInt64(pid), plantPort: true)
+    if let reason = installP.failure { fail("agent-install-planted \(pid) refused: \(reason)") }
+    guard let report = installP.report else { fail("agent-install-planted \(pid): no report") }
+    let base = report.base
+    let inst = AgentInstaller(task: task)
+    func stateWord(_ slot: Int) -> UInt64 { inst.readSlot(base: base, slot) ?? .max }
+    let planted = stateWord(AgentBlob.plantedPortSlot)
+    print("agent-install-planted \(pid) ready=\(report.ready.map(String.init) ?? "nil") "
+          + "err=\(report.err.map(String.init) ?? "nil") base=0x" + String(base, radix: 16)
+          + " ctrlSend=\(report.ctrlSend) plantedPort=\(planted)")
+    guard report.ready == 1, report.ctrlSend != 0 else {
+        _ = AgentInstaller(task: task).remove(pid: UInt64(pid), base: base)
+        fail("agent-install-planted \(pid): not live via the planted path")
+    }
+    // Ping the blob over the extracted send right (40 B: header 24 + seq 8 + counter 8, id 2001).
+    let before = stateWord(AgentBlob.counterSlot)
+    var pings = 3
+    for seq in 1...pings {
+        var msg = [UInt8](repeating: 0, count: 40)
+        func f32(_ at: Int, _ v: UInt32) { for i in 0..<4 { msg[at + i] = UInt8((v >> (8 * i)) & 0xff) } }
+        func f64(_ at: Int, _ v: UInt64) { for i in 0..<8 { msg[at + i] = UInt8((v >> (8 * i)) & 0xff) } }
+        f32(0, 0x13)                 // msgh_bits: COPY_SEND in the remote field
+        f32(4, 40)                   // msgh_size
+        f32(8, report.ctrlSend)      // msgh_remote_port = the planted channel
+        f32(20, 2001)                // msgh_id = ping
+        f64(24, UInt64(seq))
+        let kr = msg.withUnsafeMutableBytes { b in
+            mach_msg(b.bindMemory(to: mach_msg_header_t.self).baseAddress!, MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+                     40, 0, mach_port_name_t(MACH_PORT_NULL), 100, 0)
+        }
+        if kr != KERN_SUCCESS { print("  ping \(seq) send kr=\(kr)"); pings -= 1 }
+        usleep(50_000)
+    }
+    usleep(200_000)
+    let after = stateWord(AgentBlob.counterSlot)
+    print("agent-install-planted \(pid) counter \(before) -> \(after) (pings=\(pings))")
+    _ = AgentInstaller(task: task).remove(pid: UInt64(pid), base: base)
+    exit(after > before ? 0 : 1)
 case "agent-ping":
     // P1a-0 (kept for the record): the extract-right handoff is DEAD on macOS 15 —
     // mach_port_extract_right on a target-allocated name returns KERN_INVALID_CAPITAL (18),
