@@ -51,6 +51,9 @@ public final class ScanLoop {
     /// window's change again with no key read, so a change an app silently undid (iTerm rebuilding
     /// its tab-bar titlebar on a tab open — not a focus change, not a key transition) comes back
     /// even on a busy app the read cannot reach. See `cycle` and `WindowTracker.update(reassert:)`.
+    /// This is now a slow belt-and-suspenders: the in-agent border observer and the setHasShadow:
+    /// override handle the shadow "border" the moment iTerm redraws it (P1e/P1f), so the scan
+    /// re-assert only needs to catch other silent re-decorations, not race the ~0.25s flash.
     private var lastReassert: TimeInterval = 0
     private let reassertInterval: TimeInterval
 
@@ -69,7 +72,7 @@ public final class ScanLoop {
                 engine: ChangeEngine,
                 buttonsHidden: @escaping ButtonsSetting = { false },
                 keyReadInterval: TimeInterval = 2.0,
-                reassertInterval: TimeInterval = 0.2,
+                reassertInterval: TimeInterval = 2.0,
                 log: @escaping Log,
                 status: @escaping Status = { _ in }) {
         self.interval = interval

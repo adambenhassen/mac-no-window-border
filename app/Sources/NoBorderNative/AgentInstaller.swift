@@ -66,16 +66,36 @@ public final class AgentInstaller {
         let base = UInt64(address)
         put(AgentBlob.cbAddrSlot, base &+ UInt64(blob.cbOff))
         put(AgentBlob.timerCbAddrSlot, base &+ UInt64(blob.timerOff))
+        // P1e: the observer callback and the teardown subroutine are absolute addresses too
+        // (knowable only after vm_allocate), and the three CFRunLoopObserver functions are
+        // prefilled into fresh slots — they stay out of the function table so its 22 entries, and
+        // every state offset below them, are unmoved.
+        put(AgentBlob.observerCbAddrSlot, base &+ UInt64(blob.observerOff))
+        put(AgentBlob.teardownAddrSlot, base &+ UInt64(blob.teardownOff))
+        put(AgentBlob.observerCreateSlot, addresses.cfRunLoopObserverCreate)
+        put(AgentBlob.observerAddSlot, addresses.cfRunLoopAddObserver)
+        put(AgentBlob.observerInvalidateSlot, addresses.cfRunLoopObserverInvalidate)
+        // P1f: the setHasShadow: override — the IMP's absolute address and the four ObjC-runtime
+        // functions (out of the function table). The IMP has no context pointer, so its state-page
+        // base is patched into its first four words (a movImm64 placeholder) below.
+        put(AgentBlob.shadowImpAddrSlot, base &+ UInt64(blob.shadowImpOff))
+        put(AgentBlob.classAddMethodSlot, addresses.classAddMethod)
+        put(AgentBlob.classGetMethodImpSlot, addresses.classGetMethodImplementation)
+        put(AgentBlob.classGetInstanceMethodSlot, addresses.classGetInstanceMethod)
+        put(AgentBlob.methodSetImpSlot, addresses.methodSetImplementation)
         for (index, value) in addresses.table.enumerated() {
             put(AgentBlob.tableSlot + 8 * index, value)
         }
+        var code = blob.code
+        let movWords = Arc64.movImm64(dst: 17, value: base &+ UInt64(AgentBlob.pageSize))
+        for (i, word) in movWords.enumerated() { code[blob.shadowImpOff / 4 + i] = word }
 
         // The region is writable from `vm_allocate`; write both pages, then split: the code page
         // RX (the all-RX writer's problem — writable state needs its own page, verdict 5), the
         // state page RW. Instruction-cache coherency is the property every remote write on this
         // OS already relies on: cross-task `vm_write` pages execute coherently (the shipped
         // executor's whole test history; the entry's first ping ACK is this install's proof).
-        guard write(blob.code, at: base), write(state, at: base &+ UInt64(AgentBlob.pageSize)) else {
+        guard write(code, at: base), write(state, at: base &+ UInt64(AgentBlob.pageSize)) else {
             vm_deallocate(task.port, address, vm_size_t(AgentBlob.regionBytes))
             return (nil, "vm_write failed")
         }
@@ -151,6 +171,8 @@ public final class AgentInstaller {
             ("selNameCursor", AgentBlob.selNameCursorSlot),
             ("selStoreCursor", AgentBlob.selStoreCursorSlot),
             ("selLoopCount", AgentBlob.selLoopCountSlot),
+            ("observerRef", AgentBlob.observerRefSlot),
+            ("shadowClassCount", AgentBlob.shadowClassCountSlot),
         ]
         var out = slots.map { (name, at) in (name, task.readWord(at: state &+ UInt64(at))) }
         func bytes(_ at: Int, _ n: Int) -> String {

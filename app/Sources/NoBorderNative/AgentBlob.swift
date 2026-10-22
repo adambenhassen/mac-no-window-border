@@ -38,6 +38,19 @@ public struct AgentAddresses: Equatable {
     public var timeGetCurrent: UInt64
     /// P1c: arming the wake timer on the main run loop (CFRunLoopAddTimer).
     public var runLoopAddTimer: UInt64
+    /// P1e: the border observer. These stay OUT of `table` — adding them would grow the 22-entry
+    /// function table and move `cbAddrSlot=240` and every state offset below it. The installer
+    /// prefills them into the fresh `observerCreateSlot`/`observerAddSlot`/`observerInvalidateSlot`
+    /// instead. Create + add arm the observer in the entry; invalidate tears it down in the blob's
+    /// teardown subroutine.
+    public var cfRunLoopObserverCreate: UInt64
+    public var cfRunLoopAddObserver: UInt64
+    public var cfRunLoopObserverInvalidate: UInt64
+    /// P1f: the ObjC runtime functions for the setHasShadow: override (also out of `table`).
+    public var classAddMethod: UInt64
+    public var classGetMethodImplementation: UInt64
+    public var classGetInstanceMethod: UInt64
+    public var methodSetImplementation: UInt64
 
     public init(cfmachPortCreate: UInt64, cfmachPortGetPort: UInt64, createRunLoopSource: UInt64,
                 runLoopGetMain: UInt64, runLoopAddSource: UInt64, machMsg: UInt64,
@@ -47,7 +60,10 @@ public struct AgentAddresses: Equatable {
                 msgSend: UInt64, selRegisterName: UInt64, objcGetClass: UInt64,
                 runLoopCopyCurrentMode: UInt64, defaultModeVar: UInt64,
                 timerCreate: UInt64, timerInvalidate: UInt64, timeGetCurrent: UInt64,
-                runLoopAddTimer: UInt64) {
+                runLoopAddTimer: UInt64, cfRunLoopObserverCreate: UInt64,
+                cfRunLoopAddObserver: UInt64, cfRunLoopObserverInvalidate: UInt64,
+                classAddMethod: UInt64, classGetMethodImplementation: UInt64,
+                classGetInstanceMethod: UInt64, methodSetImplementation: UInt64) {
         self.cfmachPortCreate = cfmachPortCreate
         self.cfmachPortGetPort = cfmachPortGetPort
         self.createRunLoopSource = createRunLoopSource
@@ -70,6 +86,13 @@ public struct AgentAddresses: Equatable {
         self.timerInvalidate = timerInvalidate
         self.timeGetCurrent = timeGetCurrent
         self.runLoopAddTimer = runLoopAddTimer
+        self.cfRunLoopObserverCreate = cfRunLoopObserverCreate
+        self.cfRunLoopAddObserver = cfRunLoopAddObserver
+        self.cfRunLoopObserverInvalidate = cfRunLoopObserverInvalidate
+        self.classAddMethod = classAddMethod
+        self.classGetMethodImplementation = classGetMethodImplementation
+        self.classGetInstanceMethod = classGetInstanceMethod
+        self.methodSetImplementation = methodSetImplementation
     }
 
     /// All of them, from this process. nil for the first one that does not resolve.
@@ -100,7 +123,14 @@ public struct AgentAddresses: Equatable {
               let timerCreate = address("CFRunLoopTimerCreate"),
               let timerInvalidate = address("CFRunLoopTimerInvalidate"),
               let timeGetCurrent = address("CFAbsoluteTimeGetCurrent"),
-              let runLoopAddTimer = address("CFRunLoopAddTimer") else { return nil }
+              let runLoopAddTimer = address("CFRunLoopAddTimer"),
+              let cfRunLoopObserverCreate = address("CFRunLoopObserverCreate"),
+              let cfRunLoopAddObserver = address("CFRunLoopAddObserver"),
+              let cfRunLoopObserverInvalidate = address("CFRunLoopObserverInvalidate"),
+              let classAddMethod = address("class_addMethod"),
+              let classGetMethodImplementation = address("class_getMethodImplementation"),
+              let classGetInstanceMethod = address("class_getInstanceMethod"),
+              let methodSetImplementation = address("method_setImplementation") else { return nil }
         return AgentAddresses(cfmachPortCreate: cfmachPortCreate, cfmachPortGetPort: cfmachPortGetPort,
                               createRunLoopSource: createRunLoopSource, runLoopGetMain: runLoopGetMain,
                               runLoopAddSource: runLoopAddSource, machMsg: machMsg,
@@ -113,7 +143,14 @@ public struct AgentAddresses: Equatable {
                               runLoopCopyCurrentMode: runLoopCopyCurrentMode,
                               defaultModeVar: defaultModeVar, timerCreate: timerCreate,
                               timerInvalidate: timerInvalidate, timeGetCurrent: timeGetCurrent,
-                              runLoopAddTimer: runLoopAddTimer)
+                              runLoopAddTimer: runLoopAddTimer,
+                              cfRunLoopObserverCreate: cfRunLoopObserverCreate,
+                              cfRunLoopAddObserver: cfRunLoopAddObserver,
+                              cfRunLoopObserverInvalidate: cfRunLoopObserverInvalidate,
+                              classAddMethod: classAddMethod,
+                              classGetMethodImplementation: classGetMethodImplementation,
+                              classGetInstanceMethod: classGetInstanceMethod,
+                              methodSetImplementation: methodSetImplementation)
     }
 
     /// The table as it goes into the state page, in the slot order the blob reads it.
@@ -266,6 +303,45 @@ public enum AgentBlob {
     public static let selNameCursorSlot = 2704
     public static let selStoreCursorSlot = 2712
     public static let selLoopCountSlot = 2720
+    // P1e: the border observer (a CFRunLoopObserver on kCFRunLoopBeforeWaiting that re-removes
+    // iTerm's window border the instant a tab/window switch redraws it) and the teardown
+    // subroutine. Fresh slots past selLoopCountSlot (the highest offset the blob ever writes) —
+    // genuinely free and zeroed, so no collision (the "2040 ldr ceiling" the machPortRef note
+    // blamed was a stale-value collision, not an encoding limit). The function table is NOT grown:
+    // cbAddrSlot=240 and every offset below it stay put. The three function addresses are prefilled
+    // by the installer (they are not in AgentAddresses.table), the two absolute code addresses are
+    // patched by the installer like cbAddr/timerCbAddr, and observerRef is written by the entry and
+    // read by the teardown.
+    public static let observerCreateSlot = 2728      // CFRunLoopObserverCreate (installer prefill)
+    public static let observerAddSlot = 2736         // CFRunLoopAddObserver (installer prefill)
+    public static let observerInvalidateSlot = 2744  // CFRunLoopObserverInvalidate (installer prefill)
+    public static let observerCbAddrSlot = 2752      // absolute, patched by the installer
+    public static let observerRefSlot = 2760         // the created observer (entry writes, teardown reads)
+    public static let teardownAddrSlot = 2768        // absolute teardown entry (patched; the remove block calls it)
+    // P1e: two extra selectors the observer sends after a re-apply to collapse the one-frame lag —
+    // invalidateShadow forces the window shadow to recompute this cycle (setHasShadow:NO only marks
+    // it), displayIfNeeded forces the decoration redraw. Resolved in a fresh slot each (the packed
+    // selector range selWindow..selDecoGetter is full), by the entry after the class.
+    public static let selInvalidateShadowSlot = 2824 // invalidateShadow
+    public static let selDisplaySlot = 2832          // displayIfNeeded
+    // P1f: the setHasShadow: override — the zero-flash path. iTerm re-enables the shadow
+    // synchronously on every tab switch (updateForTransparency:), and no reactive hook can beat the
+    // window server to the frame; overriding setHasShadow: to force NO on managed windows stops the
+    // shadow from ever turning on. The four ObjC-runtime functions are prefilled (out of the
+    // function table). shadowImpAddr is the IMP's absolute address (patched). shadowClassTable holds
+    // the classes we added the override to (for the teardown restore — CRITICAL).
+    public static let classAddMethodSlot = 2840          // class_addMethod (installer prefill)
+    public static let classGetMethodImpSlot = 2848       // class_getMethodImplementation (prefill)
+    public static let classGetInstanceMethodSlot = 2856  // class_getInstanceMethod (prefill)
+    public static let methodSetImpSlot = 2864            // method_setImplementation (prefill)
+    public static let selClassSlot = 2872                // the `class` selector (entry-resolved)
+    public static let shadowOrigSlot = 2880              // NSWindow's setHasShadow: IMP (entry-resolved)
+    public static let shadowImpAddrSlot = 2888           // the override IMP's absolute address (patched)
+    public static let shadowClassCountSlot = 2896        // count of classes overridden
+    public static let shadowTypesSlot = 2904             // "v@:B\0" — the method type encoding
+    public static let shadowClassTableSlot = 2912        // up to 4 overridden classes (4×8), for teardown
+    public static let shadowClassTableCount = 4
+    public static let shadowClassTableEnd = shadowClassTableSlot + shadowClassTableCount * 8   // 2944
 
     public struct Built {
         public var code: [UInt32]
@@ -278,11 +354,22 @@ public enum AgentBlob {
         /// slot, so it finds state through the context pointer, and the arm code finds the
         /// callback address only through state).
         public var timerOff: Int
+        /// The P1e border observer and the teardown subroutine, 16-aligned after the timer; the
+        /// installer patches their absolute addresses into `observerCbAddrSlot` / `teardownAddrSlot`.
+        public var observerOff: Int
+        public var teardownOff: Int
+        /// The P1f setHasShadow: override IMP, 16-aligned after the teardown. The installer patches
+        /// its absolute address into `shadowImpAddrSlot` and patches its first four words (a
+        /// movImm64 placeholder) with the state-page base so the IMP can reach the op table.
+        public var shadowImpOff: Int
         /// Where each function ends, in words: the audit ranges (the pad to `cbOff` and the
         /// strings after the callback are data, not code).
         public var entryWordCount: Int
         public var cbWordCount: Int
         public var timerWordCount: Int
+        public var observerWordCount: Int
+        public var teardownWordCount: Int
+        public var shadowImpWordCount: Int
     }
 
     /// Assemble the blob. `pid` is the target's; the entry formats it into the service name with
@@ -305,8 +392,17 @@ public enum AgentBlob {
         cb.assembleCallback()
         var timer = Assembler()
         timer.assembleTimer()
+        var observer = Assembler()
+        observer.assembleObserver()
+        var teardown = Assembler()
+        teardown.assembleTeardown()
+        var shadowImp = Assembler()
+        shadowImp.assembleShadowImp()
         let cbOff = (entry.bytes + 15) / 16 * 16
         let timerOff = (cbOff + cb.bytes + 15) / 16 * 16
+        let observerOff = (timerOff + timer.bytes + 15) / 16 * 16
+        let teardownOff = (observerOff + observer.bytes + 15) / 16 * 16
+        let shadowImpOff = (teardownOff + teardown.bytes + 15) / 16 * 16
         let prefix = Array(namePrefix.utf8) + [0]
         // The P1b selector names, 32 bytes each in slot order (selWindowSlot up), the class
         // name last. The entry resolves them once; the strings are RX code-page data.
@@ -318,7 +414,14 @@ public enum AgentBlob {
                         // `drawsDecorationView` and NO to `_drawsDecorationView`; with the
                         // underscore the capability gate failed and decoration was left drawn
                         // (rim=1 after apply, while shadow and corners applied fine).
-                        "isHidden", "cornerRadius", "drawsDecorationView", "NSApplication"]
+                        "isHidden", "cornerRadius", "drawsDecorationView", "NSApplication",
+                        // P1e: resolved individually by the entry after the class (not in the
+                        // selCount preflight loop) — the observer's post-reapply flush selectors.
+                        "invalidateShadow", "displayIfNeeded",
+                        // P1f: the `class` selector (to get a window's real class, not the KVO
+                        // subclass object_getClass would return) and the NSWindow class name (whose
+                        // setHasShadow: IMP is the override's tail-call target).
+                        "class", "NSWindow"]
         var namesBlock = [UInt8]()
         for name in selNames {
             var bytes = Array(name.utf8)
@@ -335,6 +438,15 @@ public enum AgentBlob {
         code.append(contentsOf: [UInt32](repeating: 0, count: timerOff / 4 - code.count))
         let timerWords = timer.resolve()
         code.append(contentsOf: timerWords)
+        code.append(contentsOf: [UInt32](repeating: 0, count: observerOff / 4 - code.count))
+        let observerWords = observer.resolve()
+        code.append(contentsOf: observerWords)
+        code.append(contentsOf: [UInt32](repeating: 0, count: teardownOff / 4 - code.count))
+        let teardownWords = teardown.resolve()
+        code.append(contentsOf: teardownWords)
+        code.append(contentsOf: [UInt32](repeating: 0, count: shadowImpOff / 4 - code.count))
+        let shadowImpWords = shadowImp.resolve()
+        code.append(contentsOf: shadowImpWords)
         let pad = (8 - code.count * 4 % 8) % 8
         var tail = [UInt8](repeating: 0, count: pad)
         tail.append(contentsOf: prefix)
@@ -364,9 +476,15 @@ public enum AgentBlob {
         put(cornerOnSlot, UInt64(truncatingIfNeeded: Double(0.01).bitPattern))
         put(cornerOffSlot, UInt64(truncatingIfNeeded: Double(0.0).bitPattern))
         put(wakeDelaySlot, UInt64(truncatingIfNeeded: Double(0.05).bitPattern))
+        // P1f: the method type encoding "v@:B" (void; self, _cmd, BOOL) for class_addMethod, as a
+        // NUL-terminated C string in a state slot (so the observer passes &state[shadowTypesSlot]
+        // without an adr into the code page).
+        for (i, byte) in Array("v@:B".utf8).enumerated() { state[shadowTypesSlot + i] = byte }
         return Built(code: code, state: state, cbOff: cbOff, timerOff: timerOff,
+                     observerOff: observerOff, teardownOff: teardownOff, shadowImpOff: shadowImpOff,
                      entryWordCount: entryWords.count, cbWordCount: cbWords.count,
-                     timerWordCount: timerWords.count)
+                     timerWordCount: timerWords.count, observerWordCount: observerWords.count,
+                     teardownWordCount: teardownWords.count, shadowImpWordCount: shadowImpWords.count)
     }
 }
 
@@ -535,9 +653,59 @@ private extension AgentBlob.Assembler {
               Arc64.blr(16)])
         branch(.cbz(src: 0, nonzero: false), "failSel")
         emit([Arc64.ldr(dst: 17, base: 31, offset: 56),
-              Arc64.str(src: 0, base: 17, offset: AgentBlob.nsAppClassSlot),
-              // x0 held the class; the preflight clobbers it. The entry's state base lives in the
-              // frame slot — restore it before the code that addresses state through x0.
+              Arc64.str(src: 0, base: 17, offset: AgentBlob.nsAppClassSlot)])
+        // P1e: resolve the two flush selectors (names after the class in the block). Advance the
+        // cursor past the class, sel_registerName each into its fresh slot. A nil answer is the
+        // same checked failure as the preflight (failSel: err=1104, nothing published).
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 56),
+              Arc64.ldr(dst: 1, base: 17, offset: AgentBlob.selNameCursorSlot),
+              Arc64.addImmBytes(dst: 1, src: 1, imm: 32),   // class -> "invalidateShadow"
+              Arc64.str(src: 1, base: 17, offset: AgentBlob.selNameCursorSlot),
+              Arc64.movReg(dst: 0, src: 1),
+              Arc64.ldr(dst: 16, base: 17, offset: tSelReg),
+              Arc64.blr(16)])
+        branch(.cbz(src: 0, nonzero: false), "failSel")
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 56),
+              Arc64.str(src: 0, base: 17, offset: AgentBlob.selInvalidateShadowSlot),
+              Arc64.ldr(dst: 1, base: 17, offset: AgentBlob.selNameCursorSlot),
+              Arc64.addImmBytes(dst: 1, src: 1, imm: 32),   // -> "displayIfNeeded"
+              Arc64.str(src: 1, base: 17, offset: AgentBlob.selNameCursorSlot),
+              Arc64.movReg(dst: 0, src: 1),
+              Arc64.ldr(dst: 16, base: 17, offset: tSelReg),
+              Arc64.blr(16)])
+        branch(.cbz(src: 0, nonzero: false), "failSel")
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 56),
+              Arc64.str(src: 0, base: 17, offset: AgentBlob.selDisplaySlot)])
+        // P1f: resolve the `class` selector (index 18) → selClassSlot.
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 56),
+              Arc64.ldr(dst: 1, base: 17, offset: AgentBlob.selNameCursorSlot),
+              Arc64.addImmBytes(dst: 1, src: 1, imm: 32),   // displayIfNeeded -> "class"
+              Arc64.str(src: 1, base: 17, offset: AgentBlob.selNameCursorSlot),
+              Arc64.movReg(dst: 0, src: 1),
+              Arc64.ldr(dst: 16, base: 17, offset: tSelReg),
+              Arc64.blr(16)])
+        branch(.cbz(src: 0, nonzero: false), "failSel")
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 56),
+              Arc64.str(src: 0, base: 17, offset: AgentBlob.selClassSlot)])
+        // objc_getClass("NSWindow") (index 19) — its setHasShadow: IMP is the override's tail-call
+        // target (iTerm's window classes don't override setHasShadow:, so NSWindow's is inherited).
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 56),
+              Arc64.ldr(dst: 1, base: 17, offset: AgentBlob.selNameCursorSlot),
+              Arc64.addImmBytes(dst: 1, src: 1, imm: 32),   // "class" -> "NSWindow"
+              Arc64.str(src: 1, base: 17, offset: AgentBlob.selNameCursorSlot),
+              Arc64.movReg(dst: 0, src: 1),
+              Arc64.ldr(dst: 16, base: 17, offset: tGetClass),
+              Arc64.blr(16)])
+        branch(.cbz(src: 0, nonzero: false), "failSel")
+        // class_getMethodImplementation(NSWindowClass, setHasShadow:) → shadowOrig. x0 = the class.
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 56),
+              Arc64.ldr(dst: 1, base: 17, offset: AgentBlob.selShadowSlot),
+              Arc64.ldr(dst: 16, base: 17, offset: AgentBlob.classGetMethodImpSlot),
+              Arc64.blr(16)])
+        branch(.cbz(src: 0, nonzero: false), "failSel")
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 56),
+              Arc64.str(src: 0, base: 17, offset: AgentBlob.shadowOrigSlot),
+              // x0 held the IMP; the code below addresses state through x0. Restore it.
               Arc64.ldr(dst: 0, base: 31, offset: 56)])
         // task_get_special_port(mach_task_self_, 4 /* BOOTSTRAP_PORT */, &state.bs) — three
         // arguments (measured 2026-10-20: with x0=state passed as the target task, the kernel
@@ -663,8 +831,45 @@ private extension AgentBlob.Assembler {
               Arc64.ldr(dst: 16, base: 17, offset: tModes),
               Arc64.ldr(dst: 2, base: 16, offset: 0),
               Arc64.ldr(dst: 16, base: 17, offset: tAdd),
+              Arc64.blr(16)])
+        // P1e: create + add the border observer BEFORE publishing ready, so ready==1 means the
+        // whole agent — op source and observer — is live (the teardown still guards observerRef as
+        // belt-and-suspenders). A nil create is non-fatal: the op path still works and the
+        // ScanLoop slow re-assert covers the border, so skip straight to ready. The context
+        // {version 0, info = state, retain 0, release 0, copy 0} is staged at [sp,#0..39] (the
+        // CFMachPortContext there is long dead). Added in DEFAULT mode only — the observer must
+        // fire where mutation is safe, never in a tracking/modal loop.
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 56),
+              Arc64.stp(dst: 31, dst2: 17, base: 31, offset: 0),   // version 0, info = state
+              Arc64.stp(dst: 31, dst2: 31, base: 31, offset: 16),  // retain 0, release 0
+              Arc64.strZero(base: 31, offset: 32),                 // copyDescription 0
+              Arc64.movz(dst: 0, value: 0),                        // allocator
+              Arc64.movz(dst: 1, value: 0x20),                     // kCFRunLoopBeforeWaiting
+              Arc64.movz(dst: 2, value: 1),                        // repeats = true
+              // order 1999999 — run LATE, just before CoreAnimation's transaction-commit observer
+              // (order 2000000), so the re-removal is the last word before compositing no matter
+              // when in the cycle iTerm redrew the border (the race that made the flash
+              // intermittent at order 0).
+              Arc64.movz(dst: 3, value: 0x847F),
+              Arc64.movk(dst: 3, value: 0x1E, shift: 16),          // 0x1E847F = 1999999
+              Arc64.ldr(dst: 4, base: 17, offset: AgentBlob.observerCbAddrSlot),
+              Arc64.addImm(dst: 5, src: 31, imm: 0),               // &context
+              Arc64.ldr(dst: 16, base: 17, offset: AgentBlob.observerCreateSlot),
               Arc64.blr(16),
+              Arc64.cmpImm(src: 0, imm: 0)])
+        branch(.cond(0), "obsEntrySkip")   // b.eq: create returned nil — go ready without it
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 56),
+              Arc64.str(src: 0, base: 17, offset: AgentBlob.observerRefSlot),
+              Arc64.ldr(dst: 16, base: 17, offset: tMain),
+              Arc64.blr(16),                                       // x0 = the main run loop
               Arc64.ldr(dst: 17, base: 31, offset: 56),
+              Arc64.ldr(dst: 1, base: 17, offset: AgentBlob.observerRefSlot),
+              Arc64.ldr(dst: 16, base: 17, offset: tDefaultMode),
+              Arc64.ldr(dst: 2, base: 16, offset: 0),              // kCFRunLoopDefaultMode value
+              Arc64.ldr(dst: 16, base: 17, offset: AgentBlob.observerAddSlot),
+              Arc64.blr(16)])
+        label("obsEntrySkip")
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 56),
               Arc64.movz(dst: 16, value: 1),
               Arc64.str(src: 16, base: 17, offset: AgentBlob.readySlot)])
         branch(.plain, "done")
@@ -1779,5 +1984,368 @@ private extension AgentBlob.Assembler {
         emit([Arc64.ldp(dst: 29, dst2: 30, base: 31, offset: 80),
               Arc64.addImm(dst: 31, src: 31, imm: 96),
               Arc64.ret()])
+    }
+
+    // MARK: the border observer (P1e)
+
+    /// The CFRunLoopObserver callback, C ABI: x0 = the observer, x1 = the activity, x2 = the
+    /// context.info = the state page. Added to the main run loop in DEFAULT mode on
+    /// kCFRunLoopBeforeWaiting, so it fires once the app has finished a redraw batch (a tab or
+    /// window switch) and is about to sleep — the instant iTerm has re-drawn its
+    /// `iTermWindowBorderView`. For each occupied apply-row whose decoration original was captured,
+    /// it reads `drawsDecorationView` on the window's titlebar and, only if the border regressed
+    /// (the getter answers YES), re-applies the window-level visual state the border lives in:
+    /// decoration off, shadow off, corner 0.01. No row/generation/ACK bookkeeping and no button
+    /// work — those stay the op path's; this is the lean synchronous re-removal that kills the
+    /// flash. Gated on depth==0 (default mode only means no mode re-check is needed); nil receivers
+    /// skip through cbz. Touches no callee-saved register; every live value crosses a call in a
+    /// frame slot.
+    mutating func assembleObserver() {
+        // Frame 80: state@0, loop count@8, row cursor@16, app@24, window@32, titlebar@40, class@48,
+        // pair@64. Every live value crosses an ObjC call in a frame slot; x0-x4/x9-x11/x15-x17 and
+        // d0 are the only registers touched, all caller-saved.
+        emit([Arc64.subImm(dst: 31, src: 31, imm: 80),
+              Arc64.stp(dst: 29, dst2: 30, base: 31, offset: 64),
+              Arc64.addImm(dst: 29, src: 31, imm: 64),
+              Arc64.str(src: 2, base: 31, offset: 0)])        // context.info = the state page
+        // Reentrancy gate: a mutation already in flight (depth>0) owns the window; do nothing.
+        // The observer is added in DEFAULT mode only, so the mode is never a tracking/modal loop
+        // here and no mode re-check is needed (mutation is mode-safe at BeforeWaiting in default).
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 0),
+              Arc64.ldr(dst: 16, base: 17, offset: AgentBlob.depthSlot),
+              Arc64.cmpImm(src: 16, imm: 0)])
+        branch(.cond(1), "obsRet")   // b.ne: depth>0
+        // Row loop over the op table.
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 0),
+              Arc64.movz(dst: 15, value: UInt16(AgentBlob.opTableCount)),
+              Arc64.str(src: 15, base: 31, offset: 8),
+              Arc64.movz(dst: 2, value: UInt16(AgentBlob.opTableSlot)),
+              Arc64.addReg(dst: 2, lhs: 2, rhs: 17),
+              Arc64.str(src: 2, base: 31, offset: 16)])
+        label("obsRowScan")
+        // occupied? flags bit 0 — division parity (flags mod 2), the blob's AND-free idiom.
+        emit([Arc64.ldr(dst: 2, base: 31, offset: 16),
+              Arc64.ldr(dst: 0, base: 2, offset: AgentBlob.rowFlags),
+              Arc64.movz(dst: 3, value: 2),
+              Arc64.udiv(dst: 1, lhs: 0, rhs: 3),
+              Arc64.mul(dst: 1, lhs: 1, rhs: 3),
+              Arc64.subReg(dst: 1, lhs: 0, rhs: 1),
+              Arc64.cmpImm(src: 1, imm: 0)])
+        branch(.cond(0), "obsRowNext")   // b.eq: bit 0 clear — free row
+        // apply rows only (rowOp == 1): a restore row's border is meant to be back.
+        emit([Arc64.ldr(dst: 0, base: 2, offset: AgentBlob.rowOp),
+              Arc64.cmpImm(src: 0, imm: 1)])
+        branch(.cond(1), "obsRowNext")   // b.ne: not an apply row
+        // decoration-known? flags bit 2 — (flags/4) mod 2. Without a captured decoration original
+        // the window never had its decoration touched, so there is nothing for the observer to
+        // re-remove (and the getter was never proven capable).
+        emit([Arc64.ldr(dst: 0, base: 2, offset: AgentBlob.rowFlags),
+              Arc64.movz(dst: 3, value: 4),
+              Arc64.udiv(dst: 1, lhs: 0, rhs: 3),
+              Arc64.movz(dst: 3, value: 2),
+              Arc64.udiv(dst: 4, lhs: 1, rhs: 3),
+              Arc64.mul(dst: 4, lhs: 4, rhs: 3),
+              Arc64.subReg(dst: 1, lhs: 1, rhs: 4),
+              Arc64.cmpImm(src: 1, imm: 0)])
+        branch(.cond(0), "obsRowNext")   // b.eq: decoration original not captured
+        // app = [NSApp sharedApplication]
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 0),
+              Arc64.ldr(dst: 0, base: 17, offset: AgentBlob.nsAppClassSlot),
+              Arc64.ldr(dst: 1, base: 17, offset: AgentBlob.selSharedAppSlot),
+              Arc64.ldr(dst: 16, base: 17, offset: tMsgSend),
+              Arc64.blr(16),
+              Arc64.str(src: 0, base: 31, offset: 24)])
+        // window = [app windowWithWindowNumber: wid]  (wid from the row)
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 0),
+              Arc64.ldr(dst: 0, base: 31, offset: 24),
+              Arc64.ldr(dst: 1, base: 17, offset: AgentBlob.selWindowSlot),
+              Arc64.ldr(dst: 2, base: 31, offset: 16),
+              Arc64.ldr(dst: 2, base: 2, offset: AgentBlob.rowWid),
+              Arc64.ldr(dst: 16, base: 17, offset: tMsgSend),
+              Arc64.blr(16)])
+        branch(.cbz(src: 0, nonzero: false), "obsRowNext")   // the window is gone
+        emit([Arc64.str(src: 0, base: 31, offset: 32)])
+        // P1f: ensure the setHasShadow: override is installed on this window's class, so iTerm's
+        // setHasShadow:YES is forced NO for our windows — zero flash. class_addMethod is idempotent
+        // (answers YES only the first time per class), so we attempt it every fire and record the
+        // class for teardown on a YES. Guarded on shadowOrig being resolved (0 if the entry's P1f
+        // resolution failed — then we skip, leaving the reactive re-apply as the backstop).
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 0),
+              Arc64.ldr(dst: 16, base: 17, offset: AgentBlob.shadowOrigSlot),
+              Arc64.cmpImm(src: 16, imm: 0)])
+        branch(.cond(0), "obsShadowDone")   // b.eq: no orig IMP — override unavailable
+        // cls = [window class]  (the real class, not object_getClass's KVO subclass)
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 0),
+              Arc64.ldr(dst: 0, base: 31, offset: 32),
+              Arc64.ldr(dst: 1, base: 17, offset: AgentBlob.selClassSlot),
+              Arc64.ldr(dst: 16, base: 17, offset: tMsgSend),
+              Arc64.blr(16),
+              Arc64.str(src: 0, base: 31, offset: 48)])   // cls
+        // Dedup: if cls is already in the override-class table, it is ensured — skip (this is also
+        // the per-fire fast path once installed). The scan reads the table through x3.
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 0),
+              Arc64.ldr(dst: 9, base: 17, offset: AgentBlob.shadowClassCountSlot),
+              Arc64.addImm(dst: 3, src: 17, imm: AgentBlob.shadowClassTableSlot)])
+        label("obsDedup")
+        branch(.cbz(src: 9, nonzero: false), "obsInstall")   // scanned all — not found, install
+        emit([Arc64.ldr(dst: 11, base: 3, offset: 0),
+              Arc64.ldr(dst: 0, base: 31, offset: 48),
+              Arc64.cmpReg(lhs: 11, rhs: 0)])
+        branch(.cond(0), "obsShadowDone")   // b.eq: already overridden this class
+        emit([Arc64.addImmBytes(dst: 3, src: 3, imm: 8),
+              Arc64.subImmBytes(dst: 9, src: 9, imm: 1)])
+        branch(.plain, "obsDedup")
+        label("obsInstall")
+        // class_addMethod(cls, setHasShadow:, shadowImp, "v@:B") — ensure cls has its OWN method
+        // (so the next method_setImplementation targets cls, not the inherited NSWindow method).
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 0),
+              Arc64.ldr(dst: 0, base: 31, offset: 48),
+              Arc64.ldr(dst: 1, base: 17, offset: AgentBlob.selShadowSlot),
+              Arc64.ldr(dst: 2, base: 17, offset: AgentBlob.shadowImpAddrSlot),
+              Arc64.addImm(dst: 3, src: 17, imm: AgentBlob.shadowTypesSlot),
+              Arc64.ldr(dst: 16, base: 17, offset: AgentBlob.classAddMethodSlot),
+              Arc64.blr(16)])
+        // m = class_getInstanceMethod(cls, setHasShadow:); method_setImplementation(m, shadowImp).
+        // Forcing the IMP (not relying on class_addMethod's result) is what makes REINSTALL work:
+        // a prior agent's teardown left cls with an own setHasShadow: (= NSWindow's IMP), so
+        // class_addMethod now answers NO and would otherwise leave the shadow unmanaged.
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 0),
+              Arc64.ldr(dst: 0, base: 31, offset: 48),
+              Arc64.ldr(dst: 1, base: 17, offset: AgentBlob.selShadowSlot),
+              Arc64.ldr(dst: 16, base: 17, offset: AgentBlob.classGetInstanceMethodSlot),
+              Arc64.blr(16)])   // x0 = Method
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 0),
+              Arc64.ldr(dst: 1, base: 17, offset: AgentBlob.shadowImpAddrSlot),
+              Arc64.ldr(dst: 16, base: 17, offset: AgentBlob.methodSetImpSlot),
+              Arc64.blr(16)])
+        // Record cls for teardown (restore its IMP before the pages free). Table full → skip the
+        // record (still overridden; a 5th class just won't be restored — bounded by design).
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 0),
+              Arc64.ldr(dst: 9, base: 17, offset: AgentBlob.shadowClassCountSlot),
+              Arc64.cmpImm(src: 9, imm: AgentBlob.shadowClassTableCount)])
+        branch(.cond(2), "obsShadowDone")   // b.hs: table full
+        emit([Arc64.addImm(dst: 3, src: 17, imm: AgentBlob.shadowClassTableSlot),
+              Arc64.movz(dst: 11, value: 8),
+              Arc64.mul(dst: 10, lhs: 9, rhs: 11),   // x10 = count * 8
+              Arc64.addReg(dst: 3, lhs: 3, rhs: 10),  // x3 = &table[count]
+              Arc64.ldr(dst: 0, base: 31, offset: 48),
+              Arc64.str(src: 0, base: 3, offset: 0),  // table[count] = cls
+              Arc64.addImmBytes(dst: 9, src: 9, imm: 1),
+              Arc64.str(src: 9, base: 17, offset: AgentBlob.shadowClassCountSlot)])
+        label("obsShadowDone")
+        // titlebar = [window _titlebarContainerView]  (the decoration view's container)
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 0),
+              Arc64.ldr(dst: 0, base: 31, offset: 32),
+              Arc64.ldr(dst: 1, base: 17, offset: AgentBlob.selTitlebarSlot),
+              Arc64.ldr(dst: 16, base: 17, offset: tMsgSend),
+              Arc64.blr(16)])
+        branch(.cbz(src: 0, nonzero: false), "obsRowNext")   // no titlebar
+        emit([Arc64.str(src: 0, base: 31, offset: 40)])
+        // Regression gate: hasShadow. iTerm re-enables the window shadow when it redraws the border
+        // on a tab/window switch (measured 2026-10-22 on iTerm: hasShadow flips YES on every
+        // switch; drawsDecorationView never does — origDeco was captured YES but the redraw does
+        // not re-set it). Our apply sets hasShadow NO, so this is a SELF-CLEARING signal: once the
+        // observer re-applies, hasShadow reads NO and it stops — no needs-display feedback loop
+        // (an unconditional re-apply spun iTerm to 70% CPU at ~1930 fires/s; the gate holds it
+        // at idle).
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 0),
+              Arc64.ldr(dst: 0, base: 31, offset: 32),
+              Arc64.ldr(dst: 1, base: 17, offset: AgentBlob.selHasShadowSlot),
+              Arc64.ldr(dst: 16, base: 17, offset: tMsgSend),
+              Arc64.blr(16)])
+        branch(.cbz(src: 0, nonzero: false), "obsRowNext")   // shadow NO — not regressed
+        // Regressed: re-apply the window-level visual state the border lives in. depth++ brackets
+        // the mutation so a nested BeforeWaiting the AppKit calls might pump cannot recurse here.
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 0),
+              Arc64.ldr(dst: 16, base: 17, offset: AgentBlob.depthSlot),
+              Arc64.addImmBytes(dst: 16, src: 16, imm: 1),
+              Arc64.str(src: 16, base: 17, offset: AgentBlob.depthSlot)])
+        // [titlebar setDrawsDecorationView: NO]
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 0),
+              Arc64.ldr(dst: 0, base: 31, offset: 40),
+              Arc64.ldr(dst: 1, base: 17, offset: AgentBlob.selDecoSlot),
+              Arc64.movz(dst: 2, value: 0),
+              Arc64.ldr(dst: 16, base: 17, offset: tMsgSend),
+              Arc64.blr(16)])
+        // [window setHasShadow: NO]  (also clears the gate so the observer stops next fire)
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 0),
+              Arc64.ldr(dst: 0, base: 31, offset: 32),
+              Arc64.ldr(dst: 1, base: 17, offset: AgentBlob.selShadowSlot),
+              Arc64.movz(dst: 2, value: 0),
+              Arc64.ldr(dst: 16, base: 17, offset: tMsgSend),
+              Arc64.blr(16)])
+        // [window _setCornerRadius: 0.01]  (d0 = the applied radius bits)
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 0),
+              Arc64.ldr(dst: 0, base: 31, offset: 32),
+              Arc64.ldr(dst: 1, base: 17, offset: AgentBlob.selCornerSlot),
+              Arc64.ldrd(dst: 0, base: 17, offset: AgentBlob.cornerOnSlot),
+              Arc64.ldr(dst: 16, base: 17, offset: tMsgSend),
+              Arc64.blr(16)])
+        // Collapse the one-frame lag: setHasShadow:NO only marks the shadow stale, so force it to
+        // recompute this cycle; displayIfNeeded forces the decoration redraw. Both run only on a
+        // real regression (gated), so the cost is per-switch, not per-fire.
+        // [window invalidateShadow]
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 0),
+              Arc64.ldr(dst: 0, base: 31, offset: 32),
+              Arc64.ldr(dst: 1, base: 17, offset: AgentBlob.selInvalidateShadowSlot),
+              Arc64.ldr(dst: 16, base: 17, offset: tMsgSend),
+              Arc64.blr(16)])
+        // [window displayIfNeeded]
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 0),
+              Arc64.ldr(dst: 0, base: 31, offset: 32),
+              Arc64.ldr(dst: 1, base: 17, offset: AgentBlob.selDisplaySlot),
+              Arc64.ldr(dst: 16, base: 17, offset: tMsgSend),
+              Arc64.blr(16)])
+        // depth--
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 0),
+              Arc64.ldr(dst: 16, base: 17, offset: AgentBlob.depthSlot),
+              Arc64.subImmBytes(dst: 16, src: 16, imm: 1),
+              Arc64.str(src: 16, base: 17, offset: AgentBlob.depthSlot)])
+        label("obsRowNext")
+        emit([Arc64.ldr(dst: 2, base: 31, offset: 16),
+              Arc64.addImmBytes(dst: 2, src: 2, imm: AgentBlob.opEntryBytes),
+              Arc64.str(src: 2, base: 31, offset: 16),
+              Arc64.ldr(dst: 15, base: 31, offset: 8),
+              Arc64.subImmBytes(dst: 15, src: 15, imm: 1),
+              Arc64.str(src: 15, base: 31, offset: 8)])
+        branch(.cbz(src: 15, nonzero: true), "obsRowScan")
+        label("obsRet")
+        emit([Arc64.ldp(dst: 29, dst2: 30, base: 31, offset: 64),
+              Arc64.addImm(dst: 31, src: 31, imm: 80),
+              Arc64.ret()])
+    }
+
+    // MARK: the teardown subroutine (P1d/P1e)
+
+    /// The resident agent's teardown, `blr`-callable with x0 = the state page. It runs as the body
+    /// of the dispatched remove block (healthy main-queue CF state, no callback in flight), and
+    /// does every un-publish the agent needs before its pages are freed:
+    ///   - if an observer was created: CFRunLoopObserverInvalidate + CFRelease it (a live observer
+    ///     pointing into freed pages faults on the next run-loop tick);
+    ///   - if a wake timer is armed: CFRunLoopTimerInvalidate + CFRelease it (the P1c one-shot is
+    ///     armed only on a deferral, so this is conditional — a removal racing an armed timer was
+    ///     the pre-existing crash the side-agent note flagged);
+    ///   - P1f: restore every class we added the setHasShadow: override to (method_setImplementation
+    ///     back to the original IMP) — else every window of that class jumps into the freed blob on
+    ///     its next shadow change;
+    ///   - always: CFMachPortInvalidate the port (removes the source from every run loop) then
+    ///     CFRelease the port and the source references.
+    /// The conditionals live here because the Assembler has label/cbz branching; the Trampoline
+    /// remove block (straight-line, absolute-address codegen) cannot express them, so it now just
+    /// calls this. Frame 48: state@0, loop index@8, pair@32. x0-x2/x9-x11/x16/x17 are touched; state
+    /// is reloaded from the frame after every call (x16/x17 are ABI scratch).
+    mutating func assembleTeardown() {
+        emit([Arc64.subImm(dst: 31, src: 31, imm: 48),
+              Arc64.stp(dst: 29, dst2: 30, base: 31, offset: 32),
+              Arc64.addImm(dst: 29, src: 31, imm: 32),
+              Arc64.str(src: 0, base: 31, offset: 0)])        // the state base, reloaded after calls
+        // P1f: restore the setHasShadow: override on every recorded class before anything is freed.
+        emit([Arc64.strZero(base: 31, offset: 8)])            // loop index i = 0
+        label("tdShadowLoop")
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 0),
+              Arc64.ldr(dst: 9, base: 31, offset: 8),
+              Arc64.ldr(dst: 16, base: 17, offset: AgentBlob.shadowClassCountSlot),
+              Arc64.cmpReg(lhs: 9, rhs: 16)])
+        branch(.cond(2), "tdShadowDone")   // b.hs: i >= count — done
+        // m = class_getInstanceMethod(table[i], setHasShadow:)
+        emit([Arc64.addImm(dst: 2, src: 17, imm: AgentBlob.shadowClassTableSlot),
+              Arc64.movz(dst: 11, value: 8),
+              Arc64.mul(dst: 10, lhs: 9, rhs: 11),
+              Arc64.addReg(dst: 2, lhs: 2, rhs: 10),
+              Arc64.ldr(dst: 0, base: 2, offset: 0),           // cls = table[i]
+              Arc64.ldr(dst: 1, base: 17, offset: AgentBlob.selShadowSlot),
+              Arc64.ldr(dst: 16, base: 17, offset: AgentBlob.classGetInstanceMethodSlot),
+              Arc64.blr(16)])
+        // method_setImplementation(m, shadowOrig)
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 0),
+              Arc64.ldr(dst: 1, base: 17, offset: AgentBlob.shadowOrigSlot),
+              Arc64.ldr(dst: 16, base: 17, offset: AgentBlob.methodSetImpSlot),
+              Arc64.blr(16)])
+        emit([Arc64.ldr(dst: 9, base: 31, offset: 8),
+              Arc64.addImmBytes(dst: 9, src: 9, imm: 1),
+              Arc64.str(src: 9, base: 31, offset: 8)])
+        branch(.plain, "tdShadowLoop")
+        label("tdShadowDone")
+        // The observer, when one was created.
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 0),
+              Arc64.ldr(dst: 16, base: 17, offset: AgentBlob.observerRefSlot),
+              Arc64.cmpImm(src: 16, imm: 0)])
+        branch(.cond(0), "tdTimer")   // b.eq: no observer
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 0),
+              Arc64.ldr(dst: 16, base: 17, offset: AgentBlob.observerInvalidateSlot),
+              Arc64.ldr(dst: 0, base: 17, offset: AgentBlob.observerRefSlot),
+              Arc64.blr(16),
+              Arc64.ldr(dst: 17, base: 31, offset: 0),
+              Arc64.ldr(dst: 16, base: 17, offset: tRelease),
+              Arc64.ldr(dst: 0, base: 17, offset: AgentBlob.observerRefSlot),
+              Arc64.blr(16)])
+        // The wake timer, when one is armed (P1c one-shot; conditional — the side-agent crash).
+        label("tdTimer")
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 0),
+              Arc64.ldr(dst: 16, base: 17, offset: AgentBlob.wakeTimerSlot),
+              Arc64.cmpImm(src: 16, imm: 0)])
+        branch(.cond(0), "tdPort")   // b.eq: no timer armed
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 0),
+              Arc64.ldr(dst: 16, base: 17, offset: tTimerInvalidate),
+              Arc64.ldr(dst: 0, base: 17, offset: AgentBlob.wakeTimerSlot),
+              Arc64.blr(16),
+              Arc64.ldr(dst: 17, base: 31, offset: 0),
+              Arc64.ldr(dst: 16, base: 17, offset: tRelease),
+              Arc64.ldr(dst: 0, base: 17, offset: AgentBlob.wakeTimerSlot),
+              Arc64.blr(16)])
+        // The CFMachPort and its source — always live for a ready agent (removeAgent runs only
+        // when ready==1). Invalidate first so no callback can be scheduled, then release both refs.
+        label("tdPort")
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 0),
+              Arc64.ldr(dst: 16, base: 17, offset: tInvalidate),
+              Arc64.ldr(dst: 0, base: 17, offset: AgentBlob.machPortRefSlot),
+              Arc64.blr(16),
+              Arc64.ldr(dst: 17, base: 31, offset: 0),
+              Arc64.ldr(dst: 16, base: 17, offset: tRelease),
+              Arc64.ldr(dst: 0, base: 17, offset: AgentBlob.machPortRefSlot),
+              Arc64.blr(16),
+              Arc64.ldr(dst: 17, base: 31, offset: 0),
+              Arc64.ldr(dst: 16, base: 17, offset: tRelease),
+              Arc64.ldr(dst: 0, base: 17, offset: AgentBlob.srcRefSlot),
+              Arc64.blr(16)])
+        emit([Arc64.ldp(dst: 29, dst2: 30, base: 31, offset: 32),
+              Arc64.addImm(dst: 31, src: 31, imm: 48),
+              Arc64.ret()])
+    }
+
+    // MARK: the setHasShadow: override IMP (P1f)
+
+    /// The replacement implementation of `-[NSWindow setHasShadow:]` the observer adds to each
+    /// managed window's class. Called by the ObjC runtime with x0=self, x1=_cmd, w2=flag — a method
+    /// IMP gets NO context pointer, so the state-page base is baked into the first four words (a
+    /// movImm64 placeholder the installer patches). If `self` is one of our applied windows (op==1
+    /// in the op table), it forces the flag to NO so iTerm's `setHasShadow:YES` never turns the
+    /// shadow on — the only flash-free fix (a reactive removal always loses one frame to the window
+    /// server). Then it TAIL-CALLS (`br`, no frame) NSWindow's original IMP, so unmanaged windows
+    /// (and managed ones, now with flag NO) behave normally. A leaf that writes only caller-saved
+    /// registers; teardown restores this method to the original IMP before the pages are freed.
+    mutating func assembleShadowImp() {
+        // x17 = the state-page base (installer-patched movImm64 — MUST be the first four words).
+        emit(Arc64.movImm64(dst: 17, value: 0))
+        emit([Arc64.movz(dst: 9, value: UInt16(AgentBlob.opTableCount)),
+              Arc64.movz(dst: 10, value: UInt16(AgentBlob.opTableSlot)),
+              Arc64.addReg(dst: 10, lhs: 10, rhs: 17)])   // x10 = state + opTableSlot (row cursor)
+        label("shScan")
+        emit([Arc64.ldr(dst: 11, base: 10, offset: AgentBlob.rowObject),
+              Arc64.cmpReg(lhs: 11, rhs: 0)])
+        branch(.cond(1), "shSkip")   // b.ne: not this window
+        emit([Arc64.ldr(dst: 11, base: 10, offset: AgentBlob.rowOp),
+              Arc64.cmpImm(src: 11, imm: 1)])
+        branch(.cond(0), "shForce")  // b.eq: an applied row for self — suppress the shadow
+        label("shSkip")
+        emit([Arc64.addImmBytes(dst: 10, src: 10, imm: AgentBlob.opEntryBytes),
+              Arc64.subImmBytes(dst: 9, src: 9, imm: 1)])
+        branch(.cbz(src: 9, nonzero: true), "shScan")
+        branch(.plain, "shDone")     // scanned all rows, no match — pass the flag through
+        label("shForce")
+        emit([Arc64.movz(dst: 2, value: 0)])   // flag = NO
+        label("shDone")
+        emit([Arc64.ldr(dst: 16, base: 17, offset: AgentBlob.shadowOrigSlot),
+              Arc64.br(16)])   // tail-call NSWindow's setHasShadow:(self, _cmd, flag)
     }
 }

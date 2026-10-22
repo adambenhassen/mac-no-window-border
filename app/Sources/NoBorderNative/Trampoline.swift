@@ -738,9 +738,10 @@ public enum Trampoline {
         if let removeState = script.blobRemove {
             blob.alignToWord()
             removeOffset = blob.bytes.count
+            // The whole teardown lives in the blob now (it needs conditional branching for the
+            // observer and the wake timer), so the block only needs the state-page address — it
+            // reads the teardown entry's absolute address out of the state page and calls it.
             blob.appendWord(removeState)
-            blob.appendWord(addresses.cfmachPortInvalidate)
-            blob.appendWord(addresses.cfmachPortRelease)
         }
 
         // The block literal, 8-aligned: isa names the global class (so Block_copy is a no-op and
@@ -789,20 +790,15 @@ public enum Trampoline {
                       .loadFromBlob(dst: 16, blobOffset: stateOffset + 8),
                       .call(reg: 16)]
         } else if script.blobRemove != nil {
-            // CFMachPortInvalidate(portRef) removes the source from every run loop (any
-            // thread; we are the main thread, so no callback is in flight); then the two
-            // CFReleases drop our references. Order is invalidate FIRST: after it the run
-            // loop holds no source, so the controller's page deallocation — which follows
-            // the completion flag — cannot race a live callback.
-            let portRef: [Op] = [.loadFromBlob(dst: 0, blobOffset: removeOffset),
-                                 .loadFromPointer(dst: 0, src: 0, offset: AgentBlob.machPortRefSlot)]
-            block += portRef
-            block += [.loadFromBlob(dst: 16, blobOffset: removeOffset + 8), .call(reg: 16)]
-            block += portRef
-            block += [.loadFromBlob(dst: 16, blobOffset: removeOffset + 16), .call(reg: 16)]
+            // The teardown is one call into the blob (x0 = the state page): it invalidates and
+            // releases the observer and the wake timer when present, then the CFMachPort (which
+            // removes the source from every run loop) and the source reference. Invalidate-first
+            // ordering and the main-thread "no callback in flight" guarantee are the blob's; the
+            // controller frees the pages only after this block's completion flag. The teardown
+            // entry's absolute address is in the state page (the installer patched it there).
             block += [.loadFromBlob(dst: 0, blobOffset: removeOffset),
-                      .loadFromPointer(dst: 0, src: 0, offset: AgentBlob.srcRefSlot),
-                      .loadFromBlob(dst: 16, blobOffset: removeOffset + 16), .call(reg: 16)]
+                      .loadFromPointer(dst: 16, src: 0, offset: AgentBlob.teardownAddrSlot),
+                      .call(reg: 16)]
         } else {
             let answerStore = { (from: Int) -> [Op] in
                 [.loadFromBlob(dst: 16, blobOffset: Self.resultAddressOffset),

@@ -48,6 +48,16 @@ final class AgentBlobTests: XCTestCase {
             (["L: b L", "L2: cbz x16, L2", "L3: cbnz x3, L3", "L4: b.hs L4", "L5: b.ne L5"],
              [Arc64.b(immediate: 0), Arc64.cbz(src: 16, immediate: 0), Arc64.cbz(src: 3, immediate: 0, nonzero: true),
               Arc64.bCond(2, immediate: 0), Arc64.bCond(1, immediate: 0)]),
+            // The observer/teardown slots live past 2728; the remove block and the blob read/write
+            // them with scaled-immediate ldr/str. These pin the encoding at the exact offsets (the
+            // historical "2040 ceiling" was a slot collision, not a field limit) against clang.
+            (["ldr x16, [x0, #2768]", "ldr x0, [x17, #2760]", "str x0, [x17, #2760]",
+              "ldr x16, [x17, #2728]", "ldr x16, [x17, #2744]"],
+             [Arc64.ldr(dst: 16, base: 0, offset: AgentBlob.teardownAddrSlot),
+              Arc64.ldr(dst: 0, base: 17, offset: AgentBlob.observerRefSlot),
+              Arc64.str(src: 0, base: 17, offset: AgentBlob.observerRefSlot),
+              Arc64.ldr(dst: 16, base: 17, offset: AgentBlob.observerCreateSlot),
+              Arc64.ldr(dst: 16, base: 17, offset: AgentBlob.observerInvalidateSlot)]),
         ]
         for (lines, words) in cases {
             let hand = try asm.bytes(forHand: lines)
@@ -77,6 +87,47 @@ final class AgentBlobTests: XCTestCase {
         XCTAssertEqual(word(AgentBlob.cbOffSlot), UInt64(built.cbOff))
         XCTAssertEqual(word(AgentBlob.codeLenSlot), UInt64(built.code.count * 4))
         XCTAssertLessThanOrEqual(built.code.count * 4, AgentBlob.pageSize, "the code fits its page")
+    }
+
+    /// The observer slots (P1e) are genuinely free: distinct, 8-aligned, past the highest slot the
+    /// blob ever writes (`selLoopCountSlot`+8 = 2728 — the misdiagnosed "2040 ldr limit" on
+    /// `machPortRefSlot` was a slot collision, not an encoding ceiling), and inside the state page.
+    func testObserverSlotsAreFreeAndDistinct() {
+        let slots = [AgentBlob.observerCreateSlot, AgentBlob.observerAddSlot,
+                     AgentBlob.observerInvalidateSlot, AgentBlob.observerCbAddrSlot,
+                     AgentBlob.observerRefSlot, AgentBlob.teardownAddrSlot]
+        XCTAssertEqual(Set(slots).count, slots.count, "observer slots overlap")
+        for slot in slots {
+            XCTAssertGreaterThanOrEqual(slot, AgentBlob.selLoopCountSlot + 8, "slot \(slot) collides with a written slot")
+            XCTAssertEqual(slot % 8, 0, "slot \(slot) is not 8-aligned")
+            XCTAssertLessThan(slot + 8, AgentBlob.pageSize, "slot \(slot) overruns the state page")
+        }
+    }
+
+    /// The observer callback and the teardown subroutine are assembled, 16-aligned, and the whole
+    /// code still fits the code page. The installer patches their absolute addresses into
+    /// `observerCbAddrSlot` / `teardownAddrSlot`.
+    func testObserverAndTeardownAreBuilt() {
+        let built = AgentBlob.build(pid: 7)
+        XCTAssertEqual(built.observerOff % 16, 0, "the observer entry is 16-aligned")
+        XCTAssertEqual(built.teardownOff % 16, 0, "the teardown entry is 16-aligned")
+        XCTAssertGreaterThan(built.observerWordCount, 0)
+        XCTAssertGreaterThan(built.teardownWordCount, 0)
+        XCTAssertLessThanOrEqual(built.code.count * 4, AgentBlob.pageSize, "the code still fits its page")
+    }
+
+    /// `AgentAddresses.current()` resolves the three new CFRunLoopObserver symbols on this OS, and
+    /// they stay out of `.table` (so the 22-entry table — and `cbAddrSlot=240` below it — is
+    /// unmoved). The installer prefills them into the fresh observer slots instead.
+    func testObserverAddressesResolveAndStayOutOfTable() throws {
+        guard let a = AgentAddresses.current() else { throw XCTSkip("no agent addresses") }
+        XCTAssertNotEqual(a.cfRunLoopObserverCreate, 0)
+        XCTAssertNotEqual(a.cfRunLoopAddObserver, 0)
+        XCTAssertNotEqual(a.cfRunLoopObserverInvalidate, 0)
+        XCTAssertEqual(a.table.count, 22, "the function table must not grow")
+        XCTAssertFalse(a.table.contains(a.cfRunLoopObserverCreate))
+        XCTAssertFalse(a.table.contains(a.cfRunLoopAddObserver))
+        XCTAssertFalse(a.table.contains(a.cfRunLoopObserverInvalidate))
     }
 
     // MARK: the word audit
@@ -214,6 +265,41 @@ final class AgentBlobTests: XCTestCase {
         // loads come from the frame, state, and the mode-pointer dereference (x16).
         audit(built.code[built.timerOff / 4..<built.timerOff / 4 + built.timerWordCount],
               label: "timer", storeBases: [31, 17], loadBases: [31, 17, 16])
+        // The teardown subroutine (P1d/P1e/P1f): stores land on the frame (31 — state base and the
+        // P1f restore-loop index); loads come from the frame, the state page (x17), and the
+        // override-class table cursor (x2). (It also restores the setHasShadow: override.)
+        audit(built.code[built.teardownOff / 4..<built.teardownOff / 4 + built.teardownWordCount],
+              label: "teardown", storeBases: [31], loadBases: [31, 17, 2])
+        // The border observer (P1e/P1f): stores land on the frame (31), the state page (x17 — depth
+        // counter and the override-class table count), and the class-table cursor (x3); loads come
+        // from the frame, the state page, the row cursor (x2), and the class-table cursor (x3).
+        audit(built.code[built.observerOff / 4..<built.observerOff / 4 + built.observerWordCount],
+              label: "observer", storeBases: [31, 17, 3], loadBases: [31, 17, 2, 3])
+        // The setHasShadow: override IMP (P1f): a leaf that stores nothing and tail-calls (no ret);
+        // loads come from the op-table row cursor (x10) and the state page (x17).
+        audit(built.code[built.shadowImpOff / 4..<built.shadowImpOff / 4 + built.shadowImpWordCount],
+              label: "shadowImp", storeBases: [], loadBases: [10, 17])
+    }
+
+    /// The observer is the real regression re-removal, not a stub: it reads the `hasShadow` gate
+    /// (iTerm re-enables the shadow when it redraws the border — the self-clearing regression
+    /// signal) and re-applies via the decoration and shadow setters. A stub would load no selector
+    /// and call nothing.
+    func testObserverGatesOnShadowAndReapplies() {
+        let built = AgentBlob.build(pid: 11)
+        let words = built.code[built.observerOff / 4..<built.observerOff / 4 + built.observerWordCount]
+        var gatesOnShadow = false, setsDecoration = false, setsShadow = false
+        var calls = 0
+        for word in words {
+            if word == Arc64.ldr(dst: 1, base: 17, offset: AgentBlob.selHasShadowSlot) { gatesOnShadow = true }
+            if word == Arc64.ldr(dst: 1, base: 17, offset: AgentBlob.selDecoSlot) { setsDecoration = true }
+            if word == Arc64.ldr(dst: 1, base: 17, offset: AgentBlob.selShadowSlot) { setsShadow = true }
+            if decode(word)?.isCall == true { calls += 1 }
+        }
+        XCTAssertTrue(gatesOnShadow, "the observer gates on the hasShadow regression signal")
+        XCTAssertTrue(setsDecoration, "the observer re-applies setDrawsDecorationView:")
+        XCTAssertTrue(setsShadow, "the observer re-applies setHasShadow:")
+        XCTAssertGreaterThanOrEqual(calls, 4, "the observer resolves app/window/titlebar + gate + setters via msgSend")
     }
 
     /// The digits cursor stores live in the entry (`strb …, [x4, #8]`, `strb …, [x8]`); they are
