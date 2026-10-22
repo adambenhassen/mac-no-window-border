@@ -32,8 +32,9 @@ import AppKit
 import Darwin   // task_get_bootstrap_port (mach/task_special_ports.h), bootstrap_register (bootstrap.h)
 
 let app = NSApplication.shared
-// The border-observer test (obsreg) needs a regular, activated, key window from the start.
-let isObsreg = CommandLine.arguments.contains("obsreg")
+// The border-observer tests (obsreg, obsedge) need a regular, activated, key window from the start.
+let isObsedge = CommandLine.arguments.contains("obsedge")
+let isObsreg = CommandLine.arguments.contains("obsreg") || isObsedge
 app.setActivationPolicy(isObsreg ? .regular : .accessory)
 let usable = NSScreen.screens[0].visibleFrame
 
@@ -61,10 +62,10 @@ let small = NSRect(x: usable.minX + 200, y: usable.minY + 150, width: 600, heigh
 // obsreg uses the small frame: a full-screen window's natural drawsDecorationView is 0 (a
 // maximized window has no decoration — the project's premise), so it can't be held at 1 to
 // simulate a regression; a small window's natural value is 1 and holds what the test sets.
-let maxIsSmall = CommandLine.arguments.contains("small") || CommandLine.arguments.contains("obsreg")
+let maxIsSmall = CommandLine.arguments.contains("small") || isObsreg
 let maxWindow = makeWindow("max", maxIsSmall ? small : usable)
 // obsreg keeps a single window: a second ordered window destabilises the decoration read.
-if !CommandLine.arguments.contains("obsreg") {
+if !isObsreg {
     _ = makeWindow("floating", NSRect(x: usable.minX + 100, y: usable.minY + 100, width: 400, height: 300))
 }
 var idInfo = thread_identifier_info()
@@ -81,7 +82,7 @@ var spinCount = 0   // written by the "spin" mode below, so the loop around it c
 // The "obsreg" mode (tests/obsflash.sh) takes SIGUSR1/SIGUSR2 for the border-observer test, so
 // the shared resize handlers step aside there — resizing max would realize a new titlebar and
 // muddy the decoration read.
-if !CommandLine.arguments.contains("obsreg") {
+if !isObsreg {
     for (sig, frame) in [(SIGUSR1, small), (SIGUSR2, usable)] {
         signal(sig, SIG_IGN)
         let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
@@ -481,6 +482,102 @@ if CommandLine.arguments.contains("obsreg") {
     readSrc.setEventHandler { line("shadow now") }
     readSrc.resume()
     obsregSources.append(readSrc)
+}
+
+// The setHasShadow:-override edge cases (tests/obsedge.sh), driven by "<seq> <command> ..." lines
+// on stdin; every answer line starts with the seq. Windows are opened by name in a chosen class:
+// obs (the shared ObsWindow), a-e (five distinct classes, for the 4-slot class table), own (a class
+// with its OWN setHasShadow: — the agent must leave it alone), kvo (a class whose windows have a
+// KVO observer on hasShadow). Commands:
+//   open <name> <class>   → "<seq> <name> <wid>"
+//   set <name> <0|1>      → "<seq> shadow <name>=<v>" (read back synchronously, after the setter)
+//   read <name>           → "<seq> shadow <name>=<v>"
+//   close <name>          → "<seq> closed <name>" (closed and released)
+//   swizzle <name>        → "<seq> swizzled" (a setHasShadow: swizzle stacked on the window's
+//                           class's current IMP, calling it as the original — a third-party hook)
+//   count                 → "<seq> counts own=<n> swizzle=<n>"
+final class EdgeA: NSWindow {}
+final class EdgeB: NSWindow {}
+final class EdgeC: NSWindow {}
+final class EdgeD: NSWindow {}
+final class EdgeE: NSWindow {}
+var ownShadowCalls = 0
+var swizzleCalls = 0
+final class OwnShadowWindow: NSWindow {
+    override var hasShadow: Bool {
+        get { super.hasShadow }
+        set { ownShadowCalls += 1; super.hasShadow = newValue }
+    }
+}
+final class KvoWindow: NSWindow {}
+final class ShadowWatcher: NSObject {
+    var changes = 0
+    override func observeValue(forKeyPath keyPath: String?, of object: Any?,
+                               change: [NSKeyValueChangeKey: Any]?, context: UnsafeMutableRawPointer?) {
+        changes += 1
+    }
+}
+var edgeWindows: [String: NSWindow] = [:]
+let shadowWatcher = ShadowWatcher()
+if isObsedge {
+    NSApp.activate(ignoringOtherApps: true)
+    let classes: [String: NSWindow.Type] = ["obs": ObsWindow.self, "a": EdgeA.self, "b": EdgeB.self,
+                                            "c": EdgeC.self, "d": EdgeD.self, "e": EdgeE.self,
+                                            "own": OwnShadowWindow.self, "kvo": KvoWindow.self]
+    func handle(_ line: String) {
+        let f = line.split(separator: " ").map(String.init)
+        guard f.count >= 2 else { return }
+        let seq = f[0]
+        func say(_ text: String) { print("\(seq) \(text)"); fflush(stdout) }
+        func shadow(_ name: String) -> String { edgeWindows[name].map { $0.hasShadow ? "1" : "0" } ?? "nil" }
+        switch (f[1], f.count) {
+        case ("open", 4):
+            guard let cls = classes[f[3]] else { return say("error class \(f[3])") }
+            let offset = CGFloat(edgeWindows.count * 30)
+            let w = cls.init(contentRect: NSRect(x: usable.minX + 150 + offset, y: usable.minY + 120 + offset,
+                                                 width: 500, height: 320),
+                             styleMask: [.titled, .closable, .resizable, .miniaturizable],
+                             backing: .buffered, defer: false)
+            w.isReleasedWhenClosed = false
+            w.title = f[2]
+            w.appearance = NSAppearance(named: .darkAqua)
+            w.orderFront(nil)
+            if f[3] == "kvo" { w.addObserver(shadowWatcher, forKeyPath: "hasShadow", options: [.new], context: nil) }
+            edgeWindows[f[2]] = w
+            say("\(f[2]) \(w.windowNumber)")
+        case ("set", 4):
+            edgeWindows[f[2]]?.hasShadow = f[3] == "1"
+            say("shadow \(f[2])=\(shadow(f[2]))")
+        case ("read", 3):
+            say("shadow \(f[2])=\(shadow(f[2]))")
+        case ("close", 3):
+            if let w = edgeWindows[f[2]] {
+                if w is KvoWindow { w.removeObserver(shadowWatcher, forKeyPath: "hasShadow") }
+                w.close()
+            }
+            edgeWindows[f[2]] = nil
+            say("closed \(f[2])")
+        case ("swizzle", 3):
+            guard let w = edgeWindows[f[2]] else { return say("error window \(f[2])") }
+            let sel = NSSelectorFromString("setHasShadow:")
+            guard let m = class_getInstanceMethod(type(of: w), sel) else { return say("error method") }
+            typealias SetFn = @convention(c) (AnyObject, Selector, Bool) -> Void
+            let prev = unsafeBitCast(method_getImplementation(m), to: SetFn.self)
+            let hook: @convention(block) (AnyObject, Bool) -> Void = { obj, flag in
+                swizzleCalls += 1
+                prev(obj, sel, flag)
+            }
+            method_setImplementation(m, imp_implementationWithBlock(hook))
+            say("swizzled")
+        case ("count", 2):
+            say("counts own=\(ownShadowCalls) swizzle=\(swizzleCalls) kvo=\(shadowWatcher.changes)")
+        default:
+            say("error command \(line)")
+        }
+    }
+    Thread.detachNewThread {
+        while let line = readLine() { DispatchQueue.main.async { handle(line) } }
+    }
 }
 
 if CommandLine.arguments.contains("restoreobs") {
