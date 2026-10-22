@@ -165,15 +165,37 @@ if start intent; then
   install && {
     op apply i
     sleep 1
-    check "app asks NO while managed" "$(shadow set i 0)" 0
-    op restore i
-    check "restore keeps the app's NO (the snapshot said YES)" "$(shadow read i)" 0
-    op apply i
-    sleep 0.5
     check "app asks YES while managed (forced NO)" "$(shadow set i 1)" 0
     op restore i
     check "restore hands back the app's YES" "$(shadow read i)" 1
+    op apply i
+    sleep 0.5
+    check "app asks NO while managed (forced NO)" "$(shadow set i 0)" 0
+    op restore i
+    check "restore keeps the app's NO (the snapshot said YES)" "$(shadow read i)" 0
+    # Third cycle, no app request: restore must use the first-apply snapshot (1), not the stale NO.
+    op apply i
+    sleep 0.5
+    op restore i
+    check "restore with no new request uses the snapshot (1), not the stale NO" "$(shadow read i)" 1
     r=$(uninstall); [[ $r == *"result=ok"* && $r != *failure* ]] && pass "uninstall" || bad "uninstall: $r"
+    alive
+  }
+  finish
+fi
+
+if start retire; then
+  # #3: a window applied (op==1) at teardown, under a stacked swizzle that keeps the pages, must
+  # stop being forced — teardown retires the rows so our IMP becomes a pass-through.
+  open t obs
+  install && {
+    op apply t
+    sleep 1
+    check "managed window forced NO" "$(shadow set t 1)" 0
+    ask swizzle t > /dev/null
+    r=$(uninstall)
+    [[ $r == *"failure=kept-pages-stacked-swizzle"* ]] && pass "uninstall kept the pages" || bad "uninstall: $r"
+    check "an op==1 row is no longer forced after teardown" "$(shadow set t 1)" 1
     alive
   }
   finish

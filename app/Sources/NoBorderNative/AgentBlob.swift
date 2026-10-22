@@ -1655,9 +1655,12 @@ private extension AgentBlob.Assembler {
               Arc64.cmpImm(src: 16, imm: 1)])
         branch(.cond(0), "shadowApply")
         // Restore: the app's own latest request while applied (rowAppShadow, request + 1, recorded by
-        // the setHasShadow: override), else the apply-time snapshot (review #6).
+        // the setHasShadow: override), else the apply-time snapshot (review #6). Clearing it as it is
+        // consumed means each request is honored once — a later apply/restore with no new app request
+        // falls back to the snapshot, not a stale value (review #2).
         emit([Arc64.ldr(dst: 3, base: 31, offset: 120),
-              Arc64.ldr(dst: 2, base: 3, offset: AgentBlob.rowAppShadow)])
+              Arc64.ldr(dst: 2, base: 3, offset: AgentBlob.rowAppShadow),
+              Arc64.strZero(base: 3, offset: AgentBlob.rowAppShadow)])
         branch(.cbz(src: 2, nonzero: false), "shadowSnapshot")
         emit([Arc64.subImmBytes(dst: 2, src: 2, imm: 1)])
         branch(.plain, "shadowSend")
@@ -2373,7 +2376,20 @@ private extension AgentBlob.Assembler {
               Arc64.str(src: 9, base: 31, offset: 8)])
         branch(.plain, "tdShadowLoop")
         label("tdShadowDone")
-        // The observer, when one was created.
+        // Retire every op-table row (zero rowOp). When the pages are freed this is a harmless no-op;
+        // when they are kept (a stacked swizzle still calls our IMP, keepPages), it turns the IMP
+        // into a pure pass-through so no stale op==1 row keeps forcing a window's shadow off (#3).
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 0),
+              Arc64.movz(dst: 9, value: UInt16(AgentBlob.opTableCount)),
+              Arc64.movz(dst: 2, value: UInt16(AgentBlob.opTableSlot)),
+              Arc64.addReg(dst: 2, lhs: 2, rhs: 17)])
+        label("tdRetireLoop")
+        emit([Arc64.strZero(base: 2, offset: AgentBlob.rowOp),
+              Arc64.addImmBytes(dst: 2, src: 2, imm: AgentBlob.opEntryBytes),
+              Arc64.subImmBytes(dst: 9, src: 9, imm: 1)])
+        branch(.cbz(src: 9, nonzero: true), "tdRetireLoop")
+        // The observer, when one was created. Each released slot is zeroed after its release, so a
+        // second teardown on kept pages cannot double-free (#4).
         emit([Arc64.ldr(dst: 17, base: 31, offset: 0),
               Arc64.ldr(dst: 16, base: 17, offset: AgentBlob.observerRefSlot),
               Arc64.cmpImm(src: 16, imm: 0)])
@@ -2385,7 +2401,9 @@ private extension AgentBlob.Assembler {
               Arc64.ldr(dst: 17, base: 31, offset: 0),
               Arc64.ldr(dst: 16, base: 17, offset: tRelease),
               Arc64.ldr(dst: 0, base: 17, offset: AgentBlob.observerRefSlot),
-              Arc64.blr(16)])
+              Arc64.blr(16),
+              Arc64.ldr(dst: 17, base: 31, offset: 0),
+              Arc64.strZero(base: 17, offset: AgentBlob.observerRefSlot)])
         // The wake timer, when one is armed (P1c one-shot; conditional — the side-agent crash).
         label("tdTimer")
         emit([Arc64.ldr(dst: 17, base: 31, offset: 0),
@@ -2399,7 +2417,9 @@ private extension AgentBlob.Assembler {
               Arc64.ldr(dst: 17, base: 31, offset: 0),
               Arc64.ldr(dst: 16, base: 17, offset: tRelease),
               Arc64.ldr(dst: 0, base: 17, offset: AgentBlob.wakeTimerSlot),
-              Arc64.blr(16)])
+              Arc64.blr(16),
+              Arc64.ldr(dst: 17, base: 31, offset: 0),
+              Arc64.strZero(base: 17, offset: AgentBlob.wakeTimerSlot)])
         // The CFMachPort and its source — always live for a ready agent (removeAgent runs only
         // when ready==1). Invalidate first so no callback can be scheduled, then release both refs.
         label("tdPort")
@@ -2412,9 +2432,12 @@ private extension AgentBlob.Assembler {
               Arc64.ldr(dst: 0, base: 17, offset: AgentBlob.machPortRefSlot),
               Arc64.blr(16),
               Arc64.ldr(dst: 17, base: 31, offset: 0),
+              Arc64.strZero(base: 17, offset: AgentBlob.machPortRefSlot),
               Arc64.ldr(dst: 16, base: 17, offset: tRelease),
               Arc64.ldr(dst: 0, base: 17, offset: AgentBlob.srcRefSlot),
-              Arc64.blr(16)])
+              Arc64.blr(16),
+              Arc64.ldr(dst: 17, base: 31, offset: 0),
+              Arc64.strZero(base: 17, offset: AgentBlob.srcRefSlot)])
         emit([Arc64.ldp(dst: 29, dst2: 30, base: 31, offset: 32),
               Arc64.addImm(dst: 31, src: 31, imm: 48),
               Arc64.ret()])
@@ -2438,15 +2461,16 @@ private extension AgentBlob.Assembler {
     /// behave normally. Writes only caller-saved registers + the saved frame pair; teardown restores
     /// this method to the original IMP before the pages are freed.
     ///
-    /// Frame 64: self@0, _cmd@8, flag@16, state@24, rowWid@32, row@40, pair@48. The state base and
-    /// the row cursor are saved so they survive the windowNumber msgSend (x10/x17 are ABI scratch).
+    /// Frame 80: self@0, _cmd@8, flag@16, state@24, rowWid@32, row@40, count@48, pair@64. The state
+    /// base, the row cursor, and the scan count are saved so they survive the windowNumber msgSend
+    /// (x9/x10/x17 are ABI scratch) — the count so a mismatch keeps scanning the other rows (#1).
     mutating func assembleShadowImp() {
         // x17 = the state-page base (installer-patched movImm64 — MUST be the first four words,
         // before the prologue; the prologue does not touch x17).
         emit(Arc64.movImm64(dst: 17, value: 0))
-        emit([Arc64.subImm(dst: 31, src: 31, imm: 64),
-              Arc64.stp(dst: 29, dst2: 30, base: 31, offset: 48),
-              Arc64.addImm(dst: 29, src: 31, imm: 48),
+        emit([Arc64.subImm(dst: 31, src: 31, imm: 80),
+              Arc64.stp(dst: 29, dst2: 30, base: 31, offset: 64),
+              Arc64.addImm(dst: 29, src: 31, imm: 64),
               Arc64.str(src: 0, base: 31, offset: 0),       // self
               Arc64.str(src: 1, base: 31, offset: 8),       // _cmd
               Arc64.str(src: 2, base: 31, offset: 16),      // flag
@@ -2467,6 +2491,7 @@ private extension AgentBlob.Assembler {
         emit([Arc64.ldr(dst: 11, base: 10, offset: AgentBlob.rowWid),
               Arc64.str(src: 11, base: 31, offset: 32),     // rowWid
               Arc64.str(src: 10, base: 31, offset: 40),     // row
+              Arc64.str(src: 9, base: 31, offset: 48),      // scan count (the call clobbers x9)
               Arc64.ldr(dst: 17, base: 31, offset: 24),     // state
               Arc64.ldr(dst: 0, base: 31, offset: 0),       // self
               Arc64.ldr(dst: 1, base: 17, offset: AgentBlob.selWindowNumberSlot),
@@ -2474,9 +2499,15 @@ private extension AgentBlob.Assembler {
               Arc64.blr(16),                                // x0 = [self windowNumber]
               Arc64.ldr(dst: 11, base: 31, offset: 32),     // rowWid
               Arc64.cmpReg(lhs: 0, rhs: 11)])
-        branch(.cond(1), "shDone")   // b.ne: same address, different window — pass through
+        branch(.cond(0), "shRecord")   // b.eq: confirmed our window
+        // Same address, a different window (the row is stale): restore the scan cursor and count the
+        // call clobbered and keep scanning — another row may hold the real managed window (#1).
+        emit([Arc64.ldr(dst: 10, base: 31, offset: 40),
+              Arc64.ldr(dst: 9, base: 31, offset: 48)])
+        branch(.plain, "shNext")
         // Confirmed our window. The app's own call (depth 0) records its request: the flag's low
         // byte (a BOOL's whole value; the upper bits of w2 are unspecified) + 1.
+        label("shRecord")
         emit([Arc64.ldr(dst: 17, base: 31, offset: 24),
               Arc64.ldr(dst: 16, base: 17, offset: AgentBlob.depthSlot)])
         branch(.cbz(src: 16, nonzero: true), "shForce")   // depth > 0: our own mutation — not intent
@@ -2500,8 +2531,8 @@ private extension AgentBlob.Assembler {
               Arc64.ldr(dst: 1, base: 31, offset: 8),       // _cmd
               Arc64.ldr(dst: 2, base: 31, offset: 16),      // flag
               Arc64.ldr(dst: 16, base: 17, offset: AgentBlob.shadowOrigSlot),
-              Arc64.ldp(dst: 29, dst2: 30, base: 31, offset: 48),
-              Arc64.addImm(dst: 31, src: 31, imm: 64),
+              Arc64.ldp(dst: 29, dst2: 30, base: 31, offset: 64),
+              Arc64.addImm(dst: 31, src: 31, imm: 80),
               Arc64.br(16)])   // tail-call NSWindow's setHasShadow:(self, _cmd, flag)
     }
 }

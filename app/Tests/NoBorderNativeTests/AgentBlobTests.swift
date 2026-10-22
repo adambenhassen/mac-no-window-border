@@ -266,10 +266,11 @@ final class AgentBlobTests: XCTestCase {
         audit(built.code[built.timerOff / 4..<built.timerOff / 4 + built.timerWordCount],
               label: "timer", storeBases: [31, 17], loadBases: [31, 17, 16])
         // The teardown subroutine (P1d/P1e/P1f): stores land on the frame (31 — state base, the
-        // P1f restore-loop index, the Method) and the state page (x17 — the kept-pages flag); loads
-        // come from the frame, the state page (x17), and the override-class table cursor (x2).
+        // P1f restore-loop index, the Method), the state page (x17 — the kept-pages flag and the
+        // zeroed released slots), and the op-table row cursor (x2 — the row-retire loop); loads come
+        // from the frame, the state page (x17), and the override-class/op-table cursor (x2).
         audit(built.code[built.teardownOff / 4..<built.teardownOff / 4 + built.teardownWordCount],
-              label: "teardown", storeBases: [31, 17], loadBases: [31, 17, 2])
+              label: "teardown", storeBases: [31, 17, 2], loadBases: [31, 17, 2])
         // The border observer (P1e/P1f): stores land on the frame (31), the state page (x17 — depth
         // counter and the override-class table count), the row cursor (x2 — the ensured flag bit),
         // and the class-table cursor (x3); loads come from the frame, the state page, the row cursor,
@@ -346,6 +347,44 @@ final class AgentBlobTests: XCTestCase {
                          AgentBlob.rowOrigButton1, AgentBlob.rowOrigButton2, AgentBlob.rowOrigDecoration]
         XCTAssertFalse(rowFields.contains(AgentBlob.rowAppShadow), "rowAppShadow overlaps a row field")
         XCTAssertLessThanOrEqual(AgentBlob.rowAppShadow + 8, AgentBlob.opEntryBytes)
+    }
+
+    /// Review #1: on a windowNumber mismatch (a closed window's address reused by a new managed
+    /// window) the override IMP must keep scanning the other rows, not end the scan. The fix saves
+    /// the scan count across the windowNumber msgSend (frame grown to 80, x9 at [sp,48]) and reloads
+    /// it on the mismatch path; without the save it could only branch to the tail-call.
+    func testOverrideContinuesScanAfterWindowNumberMismatch() {
+        let built = AgentBlob.build(pid: 19)
+        let imp = built.code[built.shadowImpOff / 4..<built.shadowImpOff / 4 + built.shadowImpWordCount]
+        XCTAssertTrue(touches(imp, offset: 48, store: true, bases: [31]),
+                      "the override saves the scan count across the windowNumber call")
+        XCTAssertTrue(touches(imp, offset: 48, store: false, bases: [31]),
+                      "the override reloads the scan count to continue the scan")
+    }
+
+    /// Review #2: `rowAppShadow` is cleared when restore consumes it, so a stale request can't
+    /// restore the wrong shadow on a later apply/restore cycle. The restore path stores 0 back
+    /// through the row cursor (x3).
+    func testRestoreClearsAppShadow() {
+        let built = AgentBlob.build(pid: 23)
+        let cb = built.code[built.cbOff / 4..<built.cbOff / 4 + built.cbWordCount]
+        XCTAssertTrue(cb.contains { $0 == Arc64.strZero(base: 3, offset: AgentBlob.rowAppShadow) },
+                      "restore zeroes rowAppShadow after consuming it")
+    }
+
+    /// Review #3/#4: when the teardown keeps the pages (a stacked swizzle still calls our IMP), the
+    /// IMP must become a pass-through — every row's op is zeroed so no stale op==1 row keeps forcing
+    /// NO — and the released CF slots are zeroed so a second teardown on kept pages cannot double-free.
+    func testTeardownRetiresRowsAndZeroesReleasedSlots() {
+        let built = AgentBlob.build(pid: 29)
+        let td = built.code[built.teardownOff / 4..<built.teardownOff / 4 + built.teardownWordCount]
+        XCTAssertTrue(touches(td, offset: AgentBlob.rowOp, store: true, bases: [2]),
+                      "teardown zeroes rowOp across the table (the IMP becomes pass-through)")
+        for slot in [AgentBlob.observerRefSlot, AgentBlob.wakeTimerSlot,
+                     AgentBlob.machPortRefSlot, AgentBlob.srcRefSlot] {
+            XCTAssertTrue(td.contains { $0 == Arc64.strZero(base: 17, offset: slot) },
+                          "teardown zeroes the released slot \(slot)")
+        }
     }
 
     /// The digits cursor stores live in the entry (`strb …, [x4, #8]`, `strb …, [x8]`); they are
