@@ -282,6 +282,55 @@ case "agent-install-planted":
     print("agent-install-planted \(pid) counter \(before) -> \(after) (pings=\(pings))")
     _ = AgentInstaller(task: task).remove(pid: UInt64(pid), base: base)
     exit(after > before ? 0 : 1)
+case "agent-planted-apply":
+    // Full planted round-trip: install planted, send an apply op (3001) to the extracted send with
+    // a reply port, read the ACK off the reply port, expect status=applied. Proves the op path and
+    // the callback's ACK-to-reply-port over the bootstrap-free channel. args: <pid> <wid>.
+    guard args.count > 3, let wid = UInt64(args[3]) else { fail("agent-planted-apply wants <pid> <wid>") }
+    let instA = AgentInstaller(task: task)
+    let ip = instA.install(pid: UInt64(pid), plantPort: true)
+    if let reason = ip.failure { fail("agent-planted-apply \(pid) refused: \(reason)") }
+    guard let rep = ip.report, rep.ready == 1, rep.ctrlSend != 0 else {
+        fail("agent-planted-apply \(pid): not live via the planted path")
+    }
+    // A reply receive port in our space; MAKE_SEND in the message hands the blob a send to it.
+    var reply: mach_port_name_t = 0
+    guard mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &reply) == KERN_SUCCESS else {
+        _ = instA.remove(pid: UInt64(pid), base: rep.base); fail("agent-planted-apply: no reply port")
+    }
+    var msg = [UInt8](repeating: 0, count: 64)
+    func m32(_ at: Int, _ v: UInt32) { for i in 0..<4 { msg[at + i] = UInt8((v >> (8 * i)) & 0xff) } }
+    func m64(_ at: Int, _ v: UInt64) { for i in 0..<8 { msg[at + i] = UInt8((v >> (8 * i)) & 0xff) } }
+    m32(0, 0x1413)                 // bits: remote COPY_SEND (0x13), local MAKE_SEND (0x14)
+    m32(4, 64)                     // size
+    m32(8, rep.ctrlSend)           // remote = the planted channel
+    m32(12, reply)                 // local = reply receive (the blob gets a send, ACKs here)
+    m32(20, 3001)                  // apply
+    m64(24, UInt64(clock_gettime_nsec_np(CLOCK_UPTIME_RAW)))  // gen
+    m64(32, wid)
+    m64(40, 1)                     // op = apply
+    m64(48, 0)                     // buttons
+    m64(56, 0)                     // session 0 (no HELLO on the planted path)
+    let skr = msg.withUnsafeMutableBytes { b in
+        mach_msg(b.bindMemory(to: mach_msg_header_t.self).baseAddress!, MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+                 64, 0, mach_port_name_t(MACH_PORT_NULL), 500, 0)
+    }
+    var status: UInt64 = .max
+    if skr == KERN_SUCCESS {
+        var ack = [UInt8](repeating: 0, count: 128)
+        let rkr = ack.withUnsafeMutableBytes { b in
+            mach_msg(b.bindMemory(to: mach_msg_header_t.self).baseAddress!, MACH_RCV_MSG | MACH_RCV_TIMEOUT,
+                     0, 128, reply, 2000, 0)
+        }
+        if rkr == KERN_SUCCESS {
+            let id = ack.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 20, as: UInt32.self) }
+            status = ack.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 40, as: UInt64.self) }
+            print("agent-planted-apply \(pid) wid=\(wid) ack_id=\(id) status=\(status)")
+        } else { print("agent-planted-apply \(pid) recv kr=\(rkr)") }
+    } else { print("agent-planted-apply \(pid) send kr=\(skr)") }
+    _ = instA.remove(pid: UInt64(pid), base: rep.base)
+    mach_port_mod_refs(mach_task_self_, reply, MACH_PORT_RIGHT_RECEIVE, -1)
+    exit(status == 1 ? 0 : 1)
 case "agent-ping":
     // P1a-0 (kept for the record): the extract-right handoff is DEAD on macOS 15 —
     // mach_port_extract_right on a target-allocated name returns KERN_INVALID_CAPITAL (18),

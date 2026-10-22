@@ -1212,8 +1212,18 @@ private extension AgentBlob.Assembler {
               Arc64.ldr(dst: 16, base: 1, offset: 48),
               Arc64.str(src: 16, base: 31, offset: 104),
               Arc64.ldr(dst: 16, base: 1, offset: 56),
-              Arc64.str(src: 16, base: 31, offset: 112),
-              Arc64.ldr(dst: 17, base: 31, offset: 64),
+              Arc64.str(src: 16, base: 31, offset: 112)])
+        // Planted rendezvous: the op carries a reply port in its incoming msgh_remote_port (@8).
+        // When present, refresh toolPort so the ACK returns to this sender — the bootstrap tool
+        // sends 0 here and keeps the toolPort its HELLO registered. (A sandboxed install has no
+        // HELLO, so tokenSlot is 0 and the planted client sends session 0 to match the gate below.)
+        emit([Arc64.ldr32(dst: 16, base: 1, offset: 8),
+              Arc64.cmpImm(src: 16, imm: 0)])
+        branch(.cond(0), "opReplyKept")   // b.eq: no reply port — keep the registered toolPort
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 64),
+              Arc64.str(src: 16, base: 17, offset: AgentBlob.toolPortSlot)])
+        label("opReplyKept")
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 64),
               Arc64.ldr(dst: 16, base: 17, offset: AgentBlob.tokenSlot),
               Arc64.ldr(dst: 0, base: 31, offset: 112),
               Arc64.cmpReg(lhs: 0, rhs: 16)])
