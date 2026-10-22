@@ -271,10 +271,11 @@ final class AgentBlobTests: XCTestCase {
         audit(built.code[built.teardownOff / 4..<built.teardownOff / 4 + built.teardownWordCount],
               label: "teardown", storeBases: [31], loadBases: [31, 17, 2])
         // The border observer (P1e/P1f): stores land on the frame (31), the state page (x17 — depth
-        // counter and the override-class table count), and the class-table cursor (x3); loads come
-        // from the frame, the state page, the row cursor (x2), and the class-table cursor (x3).
+        // counter and the override-class table count), the row cursor (x2 — the ensured flag bit),
+        // and the class-table cursor (x3); loads come from the frame, the state page, the row cursor,
+        // and the class-table cursor.
         audit(built.code[built.observerOff / 4..<built.observerOff / 4 + built.observerWordCount],
-              label: "observer", storeBases: [31, 17, 3], loadBases: [31, 17, 2, 3])
+              label: "observer", storeBases: [31, 17, 2, 3], loadBases: [31, 17, 2, 3])
         // The setHasShadow: override IMP (P1f): a leaf that stores nothing and tail-calls (no ret);
         // loads come from the op-table row cursor (x10) and the state page (x17).
         audit(built.code[built.shadowImpOff / 4..<built.shadowImpOff / 4 + built.shadowImpWordCount],

@@ -2048,6 +2048,19 @@ private extension AgentBlob.Assembler {
               Arc64.subReg(dst: 1, lhs: 1, rhs: 4),
               Arc64.cmpImm(src: 1, imm: 0)])
         branch(.cond(0), "obsRowNext")   // b.eq: decoration original not captured
+        // Fast path: once the setHasShadow: override is ensured for this row (flags bit 4), the
+        // shadow can never turn on again, so skip every msgSend — the observer costs only this
+        // cheap flag read per fire after install (answers the "is this a poll?" cost concern).
+        emit([Arc64.ldr(dst: 2, base: 31, offset: 16),
+              Arc64.ldr(dst: 0, base: 2, offset: AgentBlob.rowFlags),
+              Arc64.movz(dst: 3, value: 16),
+              Arc64.udiv(dst: 1, lhs: 0, rhs: 3),
+              Arc64.movz(dst: 3, value: 2),
+              Arc64.udiv(dst: 4, lhs: 1, rhs: 3),
+              Arc64.mul(dst: 4, lhs: 4, rhs: 3),
+              Arc64.subReg(dst: 1, lhs: 1, rhs: 4),   // (flags / 16) mod 2
+              Arc64.cmpImm(src: 1, imm: 0)])
+        branch(.cond(1), "obsRowNext")   // b.ne: override ensured — nothing to do
         // app = [NSApp sharedApplication]
         emit([Arc64.ldr(dst: 17, base: 31, offset: 0),
               Arc64.ldr(dst: 0, base: 17, offset: AgentBlob.nsAppClassSlot),
@@ -2091,7 +2104,7 @@ private extension AgentBlob.Assembler {
         emit([Arc64.ldr(dst: 11, base: 3, offset: 0),
               Arc64.ldr(dst: 0, base: 31, offset: 48),
               Arc64.cmpReg(lhs: 11, rhs: 0)])
-        branch(.cond(0), "obsShadowDone")   // b.eq: already overridden this class
+        branch(.cond(0), "obsEnsured")   // b.eq: already overridden this class — mark the row ensured
         emit([Arc64.addImmBytes(dst: 3, src: 3, imm: 8),
               Arc64.subImmBytes(dst: 9, src: 9, imm: 1)])
         branch(.plain, "obsDedup")
@@ -2123,7 +2136,7 @@ private extension AgentBlob.Assembler {
         emit([Arc64.ldr(dst: 17, base: 31, offset: 0),
               Arc64.ldr(dst: 9, base: 17, offset: AgentBlob.shadowClassCountSlot),
               Arc64.cmpImm(src: 9, imm: AgentBlob.shadowClassTableCount)])
-        branch(.cond(2), "obsShadowDone")   // b.hs: table full
+        branch(.cond(2), "obsEnsured")   // b.hs: table full — still overridden, mark the row ensured
         emit([Arc64.addImm(dst: 3, src: 17, imm: AgentBlob.shadowClassTableSlot),
               Arc64.movz(dst: 11, value: 8),
               Arc64.mul(dst: 10, lhs: 9, rhs: 11),   // x10 = count * 8
@@ -2132,6 +2145,13 @@ private extension AgentBlob.Assembler {
               Arc64.str(src: 0, base: 3, offset: 0),  // table[count] = cls
               Arc64.addImmBytes(dst: 9, src: 9, imm: 1),
               Arc64.str(src: 9, base: 17, offset: AgentBlob.shadowClassCountSlot)])
+        // Mark the row ensured (flags bit 4) so later fires skip it — reached only when bit 4 was
+        // clear (the fast path above returned otherwise), so this adds the bit exactly once.
+        label("obsEnsured")
+        emit([Arc64.ldr(dst: 2, base: 31, offset: 16),
+              Arc64.ldr(dst: 0, base: 2, offset: AgentBlob.rowFlags),
+              Arc64.addImmBytes(dst: 0, src: 0, imm: 16),
+              Arc64.str(src: 0, base: 2, offset: AgentBlob.rowFlags)])
         label("obsShadowDone")
         // titlebar = [window _titlebarContainerView]  (the decoration view's container)
         emit([Arc64.ldr(dst: 17, base: 31, offset: 0),
