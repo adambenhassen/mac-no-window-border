@@ -67,6 +67,11 @@ op() {
   NOBORDER_RZ_NAME=$SVC $tool $HP op $1 ${W[$2]} 0 1 > $out/op.out 2>&1
   grep -q "$want" $out/op.out || bad "op $1 $2: $(tail -1 $out/op.out)"
 }
+# opraw apply|restore <name>: run the op, print the raw status number.
+opraw() {
+  NOBORDER_RZ_NAME=$SVC $tool $HP op $1 ${W[$2]} 0 1 > $out/op.out 2>&1
+  grep -o 'status=[0-9]*' $out/op.out | head -1 | cut -d= -f2
+}
 uninstall() { $probe agent-uninstall $HP $BASE 2>&1; }
 # alive: drive run-loop ticks after the pages are gone, then check the host is still there.
 alive() {
@@ -196,6 +201,24 @@ if start retire; then
     r=$(uninstall)
     [[ $r == *"failure=kept-pages-stacked-swizzle"* ]] && pass "uninstall kept the pages" || bad "uninstall: $r"
     check "an op==1 row is no longer forced after teardown" "$(shadow set t 1)" 1
+    alive
+  }
+  finish
+fi
+
+if start rows; then
+  # Op-table eviction: 16 rows fill, a 17th apply is refused (table-full) while every row is a live
+  # apply; once one row is restored (finished) the 17th apply reuses it.
+  for i in $(seq 1 16); do open r$i obs; done
+  install && {
+    for i in $(seq 1 16); do op apply r$i; done
+    open r17 obs
+    check "17th apply refused while the table is full of applies" "$(opraw apply r17)" 7
+    op restore r1
+    check "17th apply reuses the finished restore row" "$(opraw apply r17)" 1
+    sleep 1
+    check "the evicted-into window is forced NO" "$(shadow set r17 1)" 0
+    r=$(uninstall); [[ $r == *"result=ok"* && $r != *failure* ]] && pass "uninstall" || bad "uninstall: $r"
     alive
   }
   finish

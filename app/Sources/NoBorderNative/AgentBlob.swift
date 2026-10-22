@@ -1191,7 +1191,13 @@ private extension AgentBlob.Assembler {
         emit([Arc64.ldr(dst: 0, base: 31, offset: 96),
               Arc64.cmpImm(src: 0, imm: 2)])
         branch(.cond(0), "ackNoOriginal")
-        emit([Arc64.ldr(dst: 0, base: 31, offset: 88),
+        // Initialize the row at [sp,152] for this apply. Reached by the free-row path and by the
+        // eviction scan (a reused completed-restore row), so it reloads the cursor and clears the
+        // fields that live outside the capture gate — rowObject and rowAppShadow — which a reused
+        // row would otherwise carry over stale (the orig* fields are re-captured, bit 1 is cleared).
+        label("initRow")
+        emit([Arc64.ldr(dst: 2, base: 31, offset: 152),
+              Arc64.ldr(dst: 0, base: 31, offset: 88),
               Arc64.str(src: 0, base: 2, offset: AgentBlob.rowWid),
               Arc64.ldr(dst: 0, base: 31, offset: 96),
               Arc64.str(src: 0, base: 2, offset: AgentBlob.rowOp),
@@ -1201,6 +1207,8 @@ private extension AgentBlob.Assembler {
               Arc64.str(src: 0, base: 2, offset: AgentBlob.rowDesiredGen),
               Arc64.strZero(base: 2, offset: AgentBlob.rowDoneGen),
               Arc64.strZero(base: 2, offset: AgentBlob.rowLastStatus),
+              Arc64.strZero(base: 2, offset: AgentBlob.rowObject),
+              Arc64.strZero(base: 2, offset: AgentBlob.rowAppShadow),
               Arc64.movz(dst: 0, value: 1),
               Arc64.str(src: 0, base: 2, offset: AgentBlob.rowFlags),
               Arc64.str(src: 2, base: 31, offset: 120)])
@@ -1217,8 +1225,42 @@ private extension AgentBlob.Assembler {
         label("scanDone")
         emit([Arc64.ldr(dst: 0, base: 31, offset: 96),
               Arc64.cmpImm(src: 0, imm: 2)])
-        branch(.cond(0), "ackNoOriginal")
-        branch(.plain, "ackTableFull")
+        branch(.cond(0), "ackNoOriginal")   // restore with no row: nothing to restore
+        // Apply with no free row: rather than refuse (ackTableFull), reuse a FINISHED row — occupied
+        // (every row is, here), a completed restore (op==2), not pending (flags bit 3 clear). Its
+        // window is already back to normal; only its replay answer is lost. An apply row is live and
+        // a pending row has work outstanding, so neither is evicted. None evictable → ackTableFull.
+        emit([Arc64.ldr(dst: 17, base: 31, offset: 64),
+              Arc64.movz(dst: 15, value: UInt16(AgentBlob.opTableCount)),
+              Arc64.str(src: 15, base: 31, offset: 144),
+              Arc64.movz(dst: 2, value: UInt16(AgentBlob.opTableSlot)),
+              Arc64.addReg(dst: 2, lhs: 2, rhs: 17),
+              Arc64.str(src: 2, base: 31, offset: 152)])
+        label("evictScan")
+        emit([Arc64.ldr(dst: 2, base: 31, offset: 152),
+              Arc64.ldr(dst: 0, base: 2, offset: AgentBlob.rowOp),
+              Arc64.cmpImm(src: 0, imm: 2)])
+        branch(.cond(1), "evictNext")   // b.ne: not a completed-restore row
+        // not pending: (flags / 8) mod 2 == 0 — division parity, the blob's AND-free idiom.
+        emit([Arc64.ldr(dst: 0, base: 2, offset: AgentBlob.rowFlags),
+              Arc64.movz(dst: 3, value: 8),
+              Arc64.udiv(dst: 1, lhs: 0, rhs: 3),
+              Arc64.movz(dst: 3, value: 2),
+              Arc64.udiv(dst: 4, lhs: 1, rhs: 3),
+              Arc64.mul(dst: 4, lhs: 4, rhs: 3),
+              Arc64.subReg(dst: 1, lhs: 1, rhs: 4),
+              Arc64.cmpImm(src: 1, imm: 0)])
+        branch(.cond(1), "evictNext")   // b.ne: pending — work outstanding, leave it
+        branch(.plain, "initRow")   // evict: reuse this row (its cursor is already [sp,152])
+        label("evictNext")
+        emit([Arc64.ldr(dst: 2, base: 31, offset: 152),
+              Arc64.addImmBytes(dst: 2, src: 2, imm: AgentBlob.opEntryBytes),
+              Arc64.str(src: 2, base: 31, offset: 152),
+              Arc64.ldr(dst: 15, base: 31, offset: 144),
+              Arc64.subImmBytes(dst: 15, src: 15, imm: 1),
+              Arc64.str(src: 15, base: 31, offset: 144)])
+        branch(.cbz(src: 15, nonzero: false), "ackTableFull")
+        branch(.plain, "evictScan")
         label("rowFound")
         // Latest-wins compares against DESIREDgen — the newest accepted request — not doneGen
         // (codex P1c review: a gen between doneGen and a pending desiredGen must not

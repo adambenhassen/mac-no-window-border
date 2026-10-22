@@ -387,6 +387,19 @@ final class AgentBlobTests: XCTestCase {
         }
     }
 
+    /// Op-table row eviction: when an apply finds no free row it reuses a finished row rather than
+    /// refusing, so a shared `initRow` clears the fields a reused row would carry over stale —
+    /// rowObject and rowAppShadow (both stored through the row cursor x2). The eviction scan reads
+    /// rowOp looking for a completed restore.
+    func testEvictionInitClearsStaleRowFields() {
+        let built = AgentBlob.build(pid: 31)
+        let cb = built.code[built.cbOff / 4..<built.cbOff / 4 + built.cbWordCount]
+        XCTAssertTrue(cb.contains { $0 == Arc64.strZero(base: 2, offset: AgentBlob.rowObject) },
+                      "initRow clears the reused row's stale object identity")
+        XCTAssertTrue(cb.contains { $0 == Arc64.strZero(base: 2, offset: AgentBlob.rowAppShadow) },
+                      "initRow clears the reused row's stale app-shadow request")
+    }
+
     /// The digits cursor stores live in the entry (`strb …, [x4, #8]`, `strb …, [x8]`); they are
     /// cursors over the state page. The entry audit above admits the state base directly; this
     /// pins the cursor stores' existence — the audit would pass a build that never wrote them.
