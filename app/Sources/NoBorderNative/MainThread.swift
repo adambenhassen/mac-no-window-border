@@ -23,6 +23,28 @@ public struct MainThread {
 /// A suspended receive can still copy out a message and replace x0 (its buffer pointer) with a
 /// 32-bit kr. Only inspect this after the park check on a suspended arm64 CF run-loop thread.
 enum ReceiveHandback {
+    /// Give a suspended receive at most 1 ms and eight state reads, independently of the entry
+    /// hunt's much longer budget. The clock is checked after IPC too: a late result is left for
+    /// the target to consume on resume. Scheduling and IPC can overrun a deadline, so this is a
+    /// limit on further work, not a real-time guarantee of how long suspension lasts.
+    static func settle(from stopped: arm_thread_state64_t, instructionBeforePC: UInt32,
+                       entryDeadline: UInt64, now: () -> UInt64, interrupt: () -> Bool,
+                       readState: () -> arm_thread_state64_t?, pause: () -> Void) -> arm_thread_state64_t? {
+        let started = now()
+        guard started < entryDeadline, instructionBeforePC == 0xD400_1001 else { return nil }
+        let deadline = min(entryDeadline, started + 1_000_000)
+        if let finished = state(from: stopped, instructionBeforePC: instructionBeforePC) { return finished }
+        guard interrupt() else { return nil }
+        for attempt in 0..<8 {
+            guard now() < deadline else { return nil }
+            guard let current = readState(), current.__pc == stopped.__pc else { return nil }
+            guard now() < deadline else { return nil }
+            if let finished = state(from: current, instructionBeforePC: instructionBeforePC) { return finished }
+            if attempt < 7 { pause() }
+        }
+        return nil
+    }
+
     static func state(from state: arm_thread_state64_t, instructionBeforePC: UInt32) -> arm_thread_state64_t? {
         // Require the return PC after svc #0x80. XNU's arm64 executable loader requires a
         // 4 GiB pagezero, so a valid buffer pointer cannot be a zero-extended 32-bit Mach kr.

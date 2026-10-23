@@ -44,4 +44,69 @@ final class ReceiveHandbackTests: XCTestCase {
             XCTAssertNil(ReceiveHandback.state(from: state(answer: 0), instructionBeforePC: instruction))
         }
     }
+
+    func testStalledReceiveUsesOnlyOneMillisecondOfTheEntryBudget() {
+        var time: UInt64 = 0
+        var reads = 0
+        let pending = state(answer: 0x16D58D168)
+        let back = ReceiveHandback.settle(from: pending, instructionBeforePC: 0xD4001001,
+            entryDeadline: 250_000_000, now: { time }, interrupt: { true },
+            readState: { reads += 1; return pending }, pause: { time += 500_000 })
+        XCTAssertNil(back)
+        XCTAssertEqual(time, 1_000_000, "a slow receive must not hold the target for the 250 ms entry hunt")
+        XCTAssertEqual(reads, 2)
+    }
+
+    func testPollingHasACallLimitEvenWhenTheClockBarelyMoves() {
+        var reads = 0
+        let pending = state(answer: 0x16D58D168)
+        let back = ReceiveHandback.settle(from: pending, instructionBeforePC: 0xD4001001,
+            entryDeadline: 250_000_000, now: { 0 }, interrupt: { true },
+            readState: { reads += 1; return reads < 20 ? pending : nil }, pause: {})
+        XCTAssertNil(back)
+        XCTAssertEqual(reads, 8, "do not repeatedly issue Mach IPCs while holding the target")
+    }
+
+    func testAReceiveThatFinishesAfterTheBudgetIsDeferred() {
+        var time: UInt64 = 0
+        let back = ReceiveHandback.settle(from: state(answer: 0x16D58D168), instructionBeforePC: 0xD4001001,
+            entryDeadline: 250_000_000, now: { time }, interrupt: { true },
+            readState: { time = 2_000_000; return self.state(answer: 0) }, pause: {})
+        XCTAssertNil(back, "a delayed IPC must not be followed by more suspended preparation work")
+    }
+
+    func testExpiredEntryBudgetDoesNotInterruptEvenACompletedReceive() {
+        let back = ReceiveHandback.settle(from: state(answer: 0), instructionBeforePC: 0xD4001001,
+            entryDeadline: 100, now: { 100 }, interrupt: { XCTFail("expired"); return true },
+            readState: { XCTFail("expired"); return nil }, pause: { XCTFail("expired") })
+        XCTAssertNil(back)
+    }
+
+    func testSuccessfulReceiveDuringSettlingKeepsItsMessage() throws {
+        var time: UInt64 = 0
+        let back = try XCTUnwrap(ReceiveHandback.settle(from: state(answer: 0x16D58D168),
+            instructionBeforePC: 0xD4001001, entryDeadline: 250_000_000, now: { time },
+            interrupt: { true }, readState: { time = 50_000; return self.state(answer: 0) }, pause: {}))
+        XCTAssertEqual(back.__x.0, 0)
+        XCTAssertEqual(back.__pc, 0x180001008)
+    }
+
+    func testSettlingHonorsAnEarlierEntryDeadline() {
+        var time: UInt64 = 0
+        var reads = 0
+        let pending = state(answer: 0x16D58D168)
+        XCTAssertNil(ReceiveHandback.settle(from: pending, instructionBeforePC: 0xD4001001,
+            entryDeadline: 100_000, now: { time }, interrupt: { true },
+            readState: { reads += 1; return pending }, pause: { time += 50_000 }))
+        XCTAssertEqual(reads, 2)
+        XCTAssertEqual(time, 100_000)
+    }
+
+    func testAlreadyCompletedReceiveNeedsNoInterruptOrPolling() throws {
+        let back = try XCTUnwrap(ReceiveHandback.settle(from: state(answer: 0),
+            instructionBeforePC: 0xD4001001, entryDeadline: 250_000_000, now: { 0 },
+            interrupt: { XCTFail("already completed"); return false },
+            readState: { XCTFail("already completed"); return nil }, pause: { XCTFail("already completed") }))
+        XCTAssertEqual(back.__x.0, 0)
+    }
 }

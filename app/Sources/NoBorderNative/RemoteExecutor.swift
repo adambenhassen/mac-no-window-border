@@ -185,8 +185,11 @@ public final class RemoteExecutor {
             guard let settled = settleReceive(on: main, stopped: stopped,
                                                deadline: started + UInt64(enterLimit * 1_000_000_000)) else {
                 main.resume()
-                usleep(1000)
-                continue
+                let stop = elapsedSince(underOurControl)
+                faults.remove()
+                // Do not suspend this target repeatedly within the 250 ms hunt after a slow
+                // receive. Its wrapper owns the unchanged result; the next scan can try again.
+                return (.notParked, stop)
             }
             let handback = ThreadHandback(from: settled)
             backToTheApp = settled
@@ -398,18 +401,11 @@ public final class RemoteExecutor {
               let instructions = task.readWord(at: stopped.__pc - 4),
               UInt32(truncatingIfNeeded: instructions) == Arc64.svcMachMsg2() else { return nil }
         let instruction = UInt32(truncatingIfNeeded: instructions)
-        if let finished = ReceiveHandback.state(from: stopped, instructionBeforePC: instruction) {
-            return finished
-        }
-        guard thread_abort_safely(main.port) == KERN_SUCCESS else { return nil }
-        while DispatchTime.now().uptimeNanoseconds < deadline {
-            guard let state = main.state(), state.__pc == stopped.__pc else { return nil }
-            if let finished = ReceiveHandback.state(from: state, instructionBeforePC: instruction) {
-                return finished
-            }
-            usleep(10)
-        }
-        return nil
+        return ReceiveHandback.settle(from: stopped, instructionBeforePC: instruction,
+                                      entryDeadline: deadline,
+                                      now: { DispatchTime.now().uptimeNanoseconds },
+                                      interrupt: { thread_abort_safely(main.port) == KERN_SUCCESS },
+                                      readState: { main.state() }, pause: { usleep(50) })
     }
 
     private func elapsedSince(_ started: UInt64) -> Int {
