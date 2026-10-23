@@ -393,8 +393,14 @@ public final class BlobClient: @unchecked Sendable {
         return nil
     }
 
+    /// The last `removeAgent`'s outcome (nil = clean deallocate). A non-nil value is either a real
+    /// teardown failure or the deliberate kept-pages case (`kept-pages-stacked-swizzle`) — in the
+    /// class's `lastInstallFailure`/`lastOpStage` diagnostic shape so a caller can see what happened.
+    public private(set) var lastRemoveFailure: String?
+
     /// Remove the agent (P1d): invalidate, release, deallocate.
     public func removeAgent(base: UInt64) {
-        _ = AgentInstaller(task: task).remove(pid: UInt64(pid), base: base)
+        let removal = AgentInstaller(task: task).remove(pid: UInt64(pid), base: base)
+        lastRemoveFailure = removal.failure
     }
 }
