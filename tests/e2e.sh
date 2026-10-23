@@ -9,6 +9,7 @@
 #                 mode that runs the shipped product, and the only one that sees the user's other
 #                 windows, so it is run on request and needs the user's own NoBorder quit first.
 set -u
+source "${0:A:h}/no-noborder.sh"
 typeset -F SECONDS  # fractional, so short check timeouts are exact
 cd "${0:A:h}/.."
 out=build/e2e

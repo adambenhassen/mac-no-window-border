@@ -11,6 +11,7 @@
 #   swizzle  a swizzle stacked on the override survives teardown, and the pages stay mapped.
 #   intent   restore hands back the app's own latest setHasShadow: request, not the apply snapshot.
 set -u
+source "${0:A:h}/no-noborder.sh"
 cd "$(dirname "$0")/.."
 host=./tests/hostapp
 probe=./build/noborder-probe

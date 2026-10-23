@@ -17,6 +17,7 @@
 # recovers; (9) fault-install: absorbed, ready=0, host RESPONSIVE (executor noop ok);
 # (10) SIGTERM: clean exit, no new crash report.
 set -u
+source "${0:A:h}/no-noborder.sh"
 typeset -F SECONDS
 cd "${0:A:h}/.."
 fail=0

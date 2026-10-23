@@ -6,6 +6,7 @@
 # latest-wins generations, deferral by starvation (tracking pump), ACK-to-departed-tool,
 # and 1000 sends with no growth in the target's vmmap regions.
 set -u
+source "${0:A:h}/no-noborder.sh"
 cd "$(dirname "$0")/.."
 R=$(pwd)
 out=$(mktemp -d /tmp/blobops.XXXXXX)

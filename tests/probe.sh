@@ -4,6 +4,7 @@
 # operations the native engine is built on; they cannot run inside `swift test`, because SwiftPM's
 # test bundle cannot carry the entitlement.
 set -u
+source "${0:A:h}/no-noborder.sh"
 cd "${0:A:h}/.."
 fail=0
 probe=build/noborder-probe

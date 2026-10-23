@@ -2,6 +2,7 @@
 # Checks the native engine changing a real AppKit window: one call script against tests/hostapp,
 # verified by pixels rather than by any window-server state.
 set -u
+source "${0:A:h}/no-noborder.sh"
 cd "${0:A:h}/.."
 fail=0
 probe=build/noborder-probe

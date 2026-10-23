@@ -14,6 +14,7 @@
 # agent survives the NSMenuTrackingMode pump (honest starvation report); (6) SIGTERM:
 # clean exit, no new crash report.
 set -u
+source "${0:A:h}/no-noborder.sh"
 typeset -F SECONDS
 cd "${0:A:h}/.."
 fail=0

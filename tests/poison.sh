@@ -19,6 +19,7 @@
 # exit:  0 = trap reproduced; 3 = loops finished, no trap (mechanism unproven: stop, re-examine);
 #        1 = a hostapp death with no cold.1 frame, or setup trouble.
 set -u
+source "${0:A:h}/no-noborder.sh"
 cd "${0:A:h}/.."
 probe=build/noborder-probe
 reports="$HOME/Library/Logs/DiagnosticReports"

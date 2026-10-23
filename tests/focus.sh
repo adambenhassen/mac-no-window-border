@@ -17,6 +17,7 @@
 # that read times out and answers nothing, and the re-apply was gated on it, so the border stood. A
 # revert re-introduces the KEYREAD on the kick and fails here.
 set -u
+source "${0:A:h}/no-noborder.sh"
 typeset -F SECONDS
 cd "${0:A:h}/.."
 out=build/focus

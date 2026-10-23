@@ -38,6 +38,7 @@ install: app
 	cp -R $(APP) /Applications/
 
 test:
+	zsh tests/no-noborder.sh
 	cd app && swift test
 	$(MAKE) testtools probe
 	tests/probe.sh

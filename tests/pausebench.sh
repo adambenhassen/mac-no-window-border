@@ -13,6 +13,7 @@
 # is measured on its own as well: apply and restore on a window that is
 # already in the state the engine is asked for, which is what a scan loop does.
 set -u
+source "${0:A:h}/no-noborder.sh"
 typeset -F SECONDS  # fractional, so the poll deadlines are exact
 cd "${0:A:h}/.."
 mkdir -p build/bench

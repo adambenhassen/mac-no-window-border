@@ -11,6 +11,7 @@
 # SYNCHRONOUSLY: max=0 proves the override forced it at the setter (not the later observer); other=1
 # proves non-managed windows keep their shadow.
 set -u
+source "${0:A:h}/no-noborder.sh"
 cd "$(dirname "$0")/.."
 host=./tests/hostapp
 probe=./build/noborder-probe
