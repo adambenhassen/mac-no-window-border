@@ -208,9 +208,64 @@ public final class BlobClient: @unchecked Sendable {
     private static let maxPendingPolls = 40   // ~40 scans (≥40 s) for the queue to drain, then give up
     /// Whether an enqueued install is still being polled: the engine keeps this client (and its
     /// pages) across scans instead of recreating it, so the poll can see the entry finally run.
-    public var isPendingInstall: Bool { pending != nil }
+    public var isPendingInstall: Bool { pending != nil || adoptBusy }
     private func ready(at base: UInt64) -> Bool {
         task.readWord(at: base &+ UInt64(AgentBlob.pageSize + AgentBlob.readySlot)) == 1
+    }
+    /// Whether this client drives an agent a prior (or crashed) controller left resident, adopted
+    /// from the registry, rather than one it installed itself. Its base is real (from the record), so
+    /// it tears down normally — the adoption just avoids a second install.
+    public private(set) var adopted = false
+    /// A recorded agent answered its name but not the HELLO handshake — alive but busy. Keep retrying
+    /// adoption on later scans; NEVER install a second agent while this is set (a busy helper is not an
+    /// absent one — reinstalling would duplicate it). `isPendingInstall` keeps the engine polling.
+    private var adoptBusy = false
+    private var adoptPolls = 0
+    /// The kernel's start time for a live pid in MICROSECONDS (sec*1e6+usec); nil when the pid is gone.
+    /// Seconds alone are not unique under pid reuse, so the registry keys on the finer value.
+    /// `proc_pidinfo(PROC_PIDTBSDINFO)` is the API that actually fills `proc_bsdinfo` (a `sysctl`
+    /// KERN_PROC reads a `kinfo_proc`, a different struct — that is why it must not be used here).
+    private static func procStart(_ pid: Int32) -> UInt64? {
+        var info = proc_bsdinfo()
+        let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+        let n = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size)
+        guard n == size else { return nil }
+        return UInt64(info.pbi_start_tvsec) &* 1_000_000 &+ UInt64(info.pbi_start_tvusec)
+    }
+    /// Why the last adopt attempt ended as it did (diagnostics).
+    public private(set) var lastAdoptReason: String?
+    private enum AdoptResult { case adopted(UInt64); case absent; case busy }
+    /// Try to adopt the agent recorded for this process. `.adopted` when it answers a HELLO (drive it,
+    /// no second install). `.absent` when there is no record, the pid was reused, its name no longer
+    /// resolves, or its port is dead (a failed SEND) — the agent is gone, so the record is dropped and
+    /// the caller installs fresh. `.busy` when the name resolved and the SEND succeeded but the
+    /// handshake did not complete — the helper is alive but backlogged, so the caller must retry, never
+    /// reinstall. The send-vs-receive split is the live-but-busy / truly-gone distinction.
+    private func attemptAdopt() -> AdoptResult {
+        guard let rec = AgentRegistry.record(for: pid) else { lastAdoptReason = "no-record"; return .absent }
+        let live = Self.procStart(pid)
+        guard rec.start == live else {
+            lastAdoptReason = "start-mismatch rec=\(rec.start) live=\(live.map(String.init) ?? "nil")"
+            AgentRegistry.remove(pid: pid); return .absent
+        }
+        rzService = rec.service
+        agentBase = rec.base
+        if hello() { adopted = true; lastInstallFailure = nil; lastAdoptReason = "adopted"; return .adopted(rec.base) }
+        let stage = lastOpStage ?? ""
+        rzService = nil; agentBase = nil
+        if agentRemote != 0 { mach_port_deallocate(mach_task_self_, agentRemote) }
+        agentRemote = 0; rzSend = 0; sendRemote = 0
+        // Only a completed SEND with no good handshake means alive-but-busy; a connect or send failure
+        // ("rz-not-found", "hello-send=…") means the registration or port is gone.
+        if stage.hasPrefix("handshake-") { lastAdoptReason = "busy:\(stage)"; return .busy }
+        lastAdoptReason = "absent:\(stage)"
+        AgentRegistry.remove(pid: pid)
+        return .absent
+    }
+    /// Record a successful bootstrap install so a later controller can adopt this agent instead of
+    /// stacking a second one. Best-effort; a registry that cannot be written just loses the barrier.
+    private func recordInstall(base: UInt64, service: String) {
+        AgentRegistry.put(AgentRecord(pid: pid, start: Self.procStart(pid) ?? 0, service: service, base: base))
     }
     /// The installer's refusal reason from the last `ensureAgent` (nil on success), for the
     /// engine's refusal line: which preflight refused is the news.
@@ -237,6 +292,7 @@ public final class BlobClient: @unchecked Sendable {
                 if p.planted { sendRemote = p.ctrlSend } else { rzService = p.service }
                 pending = nil
                 lastInstallFailure = nil
+                if !p.planted { recordInstall(base: p.base, service: p.service) }
                 return p.base
             }
             pendingPolls += 1
@@ -248,6 +304,24 @@ public final class BlobClient: @unchecked Sendable {
             }
             lastInstallFailure = "pending"
             return nil
+        }
+        // Barrier against a second install: a record for this pid means a prior controller (or this one
+        // before an unclean restart) left a bootstrap agent resident. Adopt it rather than install a
+        // second agent that would stack another observer in the target. A busy helper is retried, never
+        // reinstalled; only a proven-absent agent (no record / dead port / name gone) falls through.
+        if adoptBusy || AgentRegistry.record(for: pid) != nil {
+            switch attemptAdopt() {
+            case .adopted(let base):
+                adoptBusy = false; adoptPolls = 0
+                return base
+            case .busy:
+                adoptBusy = true; adoptPolls += 1
+                if adoptPolls >= Self.maxPendingPolls { adoptBusy = false; lastInstallFailure = "adopt-giveup"; return nil }
+                lastInstallFailure = "adopt-pending"
+                return nil
+            case .absent:
+                adoptBusy = false; adoptPolls = 0   // fall through to a fresh install
+            }
         }
         // Test hook: force the planted (sandbox) rendezvous against a non-sandboxed target, which
         // would otherwise take the bootstrap path on its first install. Offline proof only.
@@ -271,6 +345,7 @@ public final class BlobClient: @unchecked Sendable {
         if install.failure == nil, let report = install.report, report.ready == 1 {
             agentBase = report.base
             rzService = report.serviceName
+            recordInstall(base: report.base, service: report.serviceName)
             return report.base
         }
         // Busy target: the entry is enqueued but has not run within the budget. Keep the pages and
@@ -402,5 +477,8 @@ public final class BlobClient: @unchecked Sendable {
     public func removeAgent(base: UInt64) {
         let removal = AgentInstaller(task: task).remove(pid: UInt64(pid), base: base)
         lastRemoveFailure = removal.failure
+        // A clean teardown frees the pages, so the agent is gone — drop its registry record. A failed
+        // or kept-pages teardown leaves the agent resident, so the record stays (and is still adoptable).
+        if removal.failure == nil { AgentRegistry.remove(pid: pid) }
     }
 }

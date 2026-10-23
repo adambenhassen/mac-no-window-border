@@ -18,6 +18,9 @@ probe=./build/noborder-probe
 tool=./build/noborder-tool
 [[ -x $host && -x $probe && -x $tool ]] || { echo "build first (make probe testtools)"; exit 1; }
 out=$(mktemp -d /tmp/obsedge.XXXXXX)
+# BlobClient install/adopt scenarios (async, barrier) persist an agent registry; point it at a temp
+# file so the tests never touch the real controller's registry in ~/Library/Application Support.
+export NOBORDER_REGISTRY_PATH=$out/registry.json
 fail=0
 typeset -A W
 only=("$@")
@@ -261,6 +264,21 @@ if start async; then
     check "async-adopt timed out, then adopted + applied" "$r" "sawPending=true"
   else
     bad "async-adopt: $(cat $out/async.out)"
+  fi
+  finish
+fi
+
+if start barrier; then
+  # Double-install barrier: client A installs and records itself; a fresh client B on the same pid
+  # must ADOPT A's agent through the registry (same base, no second install) and drive it. This is the
+  # relaunch-after-unclean-exit path that otherwise stacks a second observer in the target. A temp
+  # registry keeps the real controller's untouched.
+  open m obs
+  if ./build/noborder-probe agent-barrier $HP ${W[m]} > $out/barrier.out 2>&1; then
+    r="$(grep -o 'bAdopted=[a-z]*' $out/barrier.out) $(grep -o 'sameBase=[a-z]*' $out/barrier.out)"
+    check "fresh client adopted the recorded agent (no 2nd install)" "$r" "bAdopted=true sameBase=true"
+  else
+    bad "agent-barrier: $(cat $out/barrier.out)"
   fi
   finish
 fi

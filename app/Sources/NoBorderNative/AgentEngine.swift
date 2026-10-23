@@ -204,7 +204,10 @@ public final class AgentEngine: ChangeEngine {
         // fresh process should never hold the serial scan loop for eight seconds.
         let attempt = installAttempts[pid] ?? 0
         holder.base = client.ensureAgent(stopLimit: attempt == 0 ? 2.0 : 8.0)
-        if holder.base == nil {
+        if holder.base == nil && client.isPendingInstall {
+            // Not a refusal: a timed-out install or an adopt of a busy resident agent is still in
+            // flight. The pending-poll branch above keeps this client and retries; no refusal, no ramp.
+        } else if holder.base == nil {
             installAttempts[pid] = attempt + 1
             holder.failedInstallAt = Self.now()
             holder.permanentlyRefused = Self.isPermanentRefusal(installErr: client.lastInstallErr)

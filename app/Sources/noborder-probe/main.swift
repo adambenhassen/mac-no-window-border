@@ -1,7 +1,7 @@
 import Foundation
 import NoBorderNative
 
-let usage = "usage: noborder-probe taskport|mainthread|park|threadinfo|runstate <pid> | run <pid> <wid> applied|restored|buttons-hidden|key|noop [fault] | run-repeat <pid> <wid> <mode> <count> | apply|restore <pid> <wid>… | agent-ping <pid> <port-name> | agent-install <pid> | agent-install-fault <pid> | agent-dump <pid> <hex-base> | agent-portinfo <pid> <hex-name> | agent-code <pid> <hex-base> <words> (rendezvous: noborder-tool <pid> [count])"
+let usage = "usage: noborder-probe taskport|mainthread|park|threadinfo|runstate <pid> | run <pid> <wid> applied|restored|buttons-hidden|key|noop [fault] | run-repeat <pid> <wid> <mode> <count> | apply|restore <pid> <wid>… | agent-ping <pid> <port-name> | agent-install <pid> | agent-install-fault <pid> | agent-dump <pid> <hex-base> | agent-portinfo <pid> <hex-name> | agent-code <pid> <hex-base> <words> | agent-barrier <pid> <wid> (rendezvous: noborder-tool <pid> [count])"
 let args = CommandLine.arguments
 guard args.count >= 3, let pid = Int32(args[2]) else {
     print(usage)
@@ -356,6 +356,22 @@ case "agent-async":
     print("agent-async \(pid) op status=\(st.map { String(describing: $0) } ?? "nil(\(client.lastOpStage ?? "?"))")")
     client.removeAgent(base: adopted)
     exit(st == .applied ? 0 : 1)
+case "agent-barrier":
+    // Prove the double-install barrier: client A installs (and records itself in the registry);
+    // a FRESH client B on the SAME pid must ADOPT A's agent via the record — same base, adopted=true,
+    // no second install — and drive it. This is the relaunch-after-unclean-exit path. The caller sets
+    // NOBORDER_REGISTRY_PATH to a temp file so the real controller's registry is never touched.
+    guard args.count > 3, let bwid = UInt32(args[3]) else { fail("agent-barrier wants <pid> <wid>") }
+    guard let a = BlobClient(pid: pid) else { fail("agent-barrier \(pid): no task port") }
+    guard let aBase = a.ensureAgent() else { fail("agent-barrier \(pid): client A install failed: \(a.lastInstallFailure ?? "?")") }
+    guard let b = BlobClient(pid: pid) else { fail("agent-barrier \(pid): client B no task port") }
+    let bBase = b.ensureAgent()
+    let st = b.op(apply: true, wid: bwid)
+    print("agent-barrier \(pid) aBase=0x\(String(aBase, radix: 16)) "
+          + "bAdopted=\(b.adopted) bBase=\(bBase.map { "0x" + String($0, radix: 16) } ?? "nil") "
+          + "sameBase=\(bBase == aBase) adoptReason=[\(b.lastAdoptReason ?? "nil")] op=\(st.map { String(describing: $0) } ?? "nil(\(b.lastOpStage ?? "?"))")")
+    a.removeAgent(base: aBase)   // clean teardown drops the record
+    exit(b.adopted && bBase == aBase && st == .applied ? 0 : 1)
 case "agent-ping":
     // P1a-0 (kept for the record): the extract-right handoff is DEAD on macOS 15 —
     // mach_port_extract_right on a target-allocated name returns KERN_INVALID_CAPITAL (18),
