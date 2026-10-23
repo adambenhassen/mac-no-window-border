@@ -116,8 +116,8 @@ public struct ThreadHandback: Equatable {
     /// x0…x30 as the app had them (x29 is the frame pointer, x30 the link register).
     public var registers: [UInt64]
     public var sp: UInt64
-    /// The address to run next: the start of the run-loop call the thread was sitting in, so it
-    /// re-issues that call instead of returning from one it never made.
+    /// The address to run next: the completed receive's original return PC. Reissuing a receive
+    /// here could overwrite a message that CoreFoundation has not consumed yet.
     public var pc: UInt64
 
     public init(registers: [UInt64], sp: UInt64, pc: UInt64) {

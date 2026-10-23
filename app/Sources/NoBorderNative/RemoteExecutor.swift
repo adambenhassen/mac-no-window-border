@@ -72,25 +72,6 @@ public final class RemoteExecutor {
         }
     }
 
-    /// `MACH_PORT_TYPE_RECEIVE` from <mach/mach_port.h> (1 << 8). The SDK header stopped
-    /// declaring this family of API, so the constants are spelled here.
-    private static let machPortTypeReceive: mach_port_type_t = 1 << 8
-
-    /// `MACH_RCV_TIMED_OUT` from <mach/message.h>: the answer a run-loop port wait gives when
-    /// its timer fires. The dispatched entry hands the app exactly this, so CoreFoundation
-    /// continues down the path it walks a hundred times a second.
-    private static let machRcvTimedOut: UInt64 = 0x1000_4003
-
-    /// `mach_port_cancel`: declared by no SDK header, and measured 2026-10-20 to export no
-    /// resolvable symbol on this OS (dlsym nil for `mach_port_cancel` and both trap spellings).
-    /// The nil answer is therefore the shipped one: delivery falls back to `thread_abort`, and
-    /// the no-restart TIMED_OUT handback is what makes that abort safe (0/30 apps × 100 entries
-    /// ran on exactly this fallback). The code keeps the cancel path for an OS that exports it.
-    private static let machPortCancel: (@convention(c) (mach_port_t, mach_port_t, mach_port_right_t) -> kern_return_t)? = {
-        guard let symbol = dlsym(dlopen(nil, RTLD_NOW), "mach_port_cancel") else { return nil }
-        return unsafeBitCast(symbol, to: (@convention(c) (mach_port_t, mach_port_t, mach_port_right_t) -> kern_return_t).self)
-    }()
-
     /// `_kernelrpc_mach_port_destruct_trap(task, name, srdelta, guard)`: destroys a right in the
     /// target, send refs and all.
     /// `mach_port_deallocate` only drops a send ref — the receive right we allocated in the
@@ -102,20 +83,6 @@ public final class RemoteExecutor {
         guard let symbol = dlsym(dlopen(nil, RTLD_NOW), "_kernelrpc_mach_port_destruct_trap") else { return nil }
         return unsafeBitCast(symbol, to: (@convention(c) (mach_port_t, mach_port_t, Int32, UInt64) -> kern_return_t).self)
     }()
-
-    /// The park's in-flight receive port, for `mach_port_cancel`: this OS's linked-receive call
-    /// packs the name into the upper half of the 128-bit argument in x3 (measured on a live
-    /// park: x3 = 0x1e0300000000 → name 0x1e03, and the same word appears as x5 with x6 = 2 =
-    /// the overmach port). Checked before cancelling — a cancel on anything that is not the
-    /// call's receive right wakes nothing and strands the entry in the kernel.
-    private static func receivePortName(in state: arm_thread_state64_t, of task: TargetTask) -> mach_port_t? {
-        let name = mach_port_t(truncatingIfNeeded: state.__x.3 >> 32)
-        guard name > 0 else { return nil }
-        var type: mach_port_type_t = 0
-        guard mach_port_type(task.port, name, &type) == KERN_SUCCESS,
-              type & machPortTypeReceive != 0 else { return nil }
-        return name
-    }
 
     /// Regions released while their dispatched block may still sit on the app's main queue. The
     /// block's invoke, literal and flag live in those pages; freeing them makes the app jump into
@@ -189,15 +156,9 @@ public final class RemoteExecutor {
             return (.failed("could not install the fault guard"), elapsedSince(started))
         }
 
-        // The entry, with the window closed. The old order — read the state, check it, point the
-        // thread, end its call — left the race Task 7 measured: anything that wakes the thread
-        // between the read and the entry has it running app code, and the state we read is a frame
-        // the app has left; entering on it jumps to a signed return address and the app dies in
-        // EXC_BAD_ACCESS (measured). Checking in between (the run_state call) narrows that window
-        // and does not close it. So the thread is stopped first, and everything — the read, the
-        // park check, the script, the new pc, the ending of the call — happens while it cannot
-        // move. What we decide is exactly what it resumes with, and the thread runs again only
-        // through `resume`, on every path.
+        // Suspend closes the race with user code, but not with the kernel receive. Settle that
+        // receive before saving or replacing registers, or setState can overwrite the success
+        // result of a message already copied into the app's buffer.
         var underOurControl: UInt64 = 0
         var backToTheApp = first
         var entered = false
@@ -217,29 +178,18 @@ public final class RemoteExecutor {
                 usleep(1000)
                 continue
             }
-            // The dispatched entry hands the thread back *out of* the call, not into it: pc is
-            // where the park sat (the instruction after the trap, inside the shim, which returns
-            // x0 as the kr) and x0 is MACH_RCV_TIMED_OUT (0x10004003) — inside CoreFoundation's
-            // tolerated set, the same answer a real timer wake leaves, so CF takes its normal
-            // timeout branch, services its sources, and issues its next receive fresh. Nothing
-            // we deliver re-registers the kernel's rcv_msg_link slot (every park on this OS is
-            // a linked receive: x2 = 0x200000000, measured 30/30): the deaths (2-3/10 per 100
-            // entries under stress — abort, cancel, and a legacy x2 = 0 restart all measured
-            // inside that band; a no-queue entry, which provokes no servicing, 0/10) are CF's
-            // next linked receive answering MACH_RCV_INVALID_ARGUMENTS on the slot the ended
-            // call vacated. The fabric path keeps the restart: it re-issues the call in the
-            // fabricated frame's own terms.
-            var handback = ThreadHandback(from: stopped, restartAt: entryOf(stopped.__pc))
-            if useDispatch {
-                handback = ThreadHandback(from: stopped, restartAt: stopped.__pc)
-                handback.registers[0] = Self.machRcvTimedOut
+            // Abort before changing state, then wait for the kernel's final result. A timer or
+            // message may win the race with the abort: that result must reach CoreFoundation.
+            // On failure, simply resume; never restore the earlier, possibly stale snapshot.
+            underOurControl = DispatchTime.now().uptimeNanoseconds
+            guard let settled = settleReceive(on: main, stopped: stopped,
+                                               deadline: started + UInt64(enterLimit * 1_000_000_000)) else {
+                main.resume()
+                usleep(1000)
+                continue
             }
-            // The state the fault guard puts on the thread if the script faults: the app's own
-            // registers — the real ones, read while it could not move — and the same return the
-            // script would have handed it.
-            backToTheApp = stopped
-            backToTheApp.__pc = handback.pc
-            if useDispatch { backToTheApp.__x.0 = Self.machRcvTimedOut }
+            let handback = ThreadHandback(from: settled)
+            backToTheApp = settled
             // The dispatched entry for every script that touches AppKit: the fabricated frame
             // queues a block and hands the thread straight back, and the selector sequence runs
             // as a block on the app's main queue. The block's invoke field names the block code
@@ -273,7 +223,7 @@ public final class RemoteExecutor {
                 faults.remove()
                 return (.failed("could not write the call script"), elapsedSince(started))
             }
-            var enter = stopped
+            var enter = settled
             enter.__pc = codeBase
             enter.__sp = stackTop                              // 16-aligned, as the ABI requires
             enter.__fp = 0
@@ -283,30 +233,8 @@ public final class RemoteExecutor {
                 faults.remove()
                 return (.failed("could not enter the call script"), elapsedSince(started))
             }
-            underOurControl = DispatchTime.now().uptimeNanoseconds
-            // A parked thread is inside a system call, in the kernel, and a new pc does nothing to
-            // it there: ending the call is what makes it pick the new pc up on its way back to
-            // user space. `thread_abort` ends it, but leaves the call's kernel-side linked-receive
-            // registration behind (every park on this OS is a linked receive: x2 = the
-            // `rcv_msg_link`, 0x200000000, measured on 30/30 parks): the next linked receive on
-            // the thread — CoreFoundation's own next servicing call — then answers
-            // `MACH_RCV_INVALID_ARGUMENTS` (0x10004013), which `__CFRunLoopServiceMachPort` traps
-            // on (the death class, captured 2026-10-20). `mach_port_cancel` on the park's receive
-            // port destroys the registration properly: the thread wakes, the slot is clean, the
-            // handback's restart registers fresh. The fabric path keeps the abort: it runs the
-            // calls in the fabricated frame and restarts nothing.
-            let delivered: Bool
-            if useDispatch, let receivePort = Self.receivePortName(in: stopped, of: task),
-               let cancel = Self.machPortCancel {
-                delivered = cancel(task.port, receivePort, MACH_PORT_RIGHT_RECEIVE) == KERN_SUCCESS
-            } else {
-                delivered = thread_abort(main.port) == KERN_SUCCESS
-            }
-            guard delivered else {
-                _ = main.setState(stopped)
-                main.resume()
-                continue
-            }
+            // The receive has already finished. Aborting here would arm an interrupt for an
+            // unrelated future call and cannot recover a result overwritten by setState.
             main.resume()
             entered = true
             break
@@ -460,14 +388,28 @@ public final class RemoteExecutor {
         return value == Self.flagNotDone ? nil : value
     }
 
-    /// The address of the function an address inside it belongs to — for a parked thread that is
-    /// `mach_msg2_trap`, whose first instruction is the trap itself. Going back there re-issues the
-    /// run loop's call; going back to the address we read would return from a call that had ended.
-    private func entryOf(_ address: UInt64) -> UInt64 {
-        guard let pointer = UnsafeRawPointer(bitPattern: Int(truncatingIfNeeded: address)) else { return address }
-        var info = Dl_info()
-        guard dladdr(pointer, &info) != 0 else { return address }
-        return UInt64(bitPattern: Int64(Int(bitPattern: info.dli_saddr)))
+    /// Finish the parked receive without letting the target run user code. `thread_abort_safely`
+    /// can race a successful receive, and its return does not promise the saved x0 is final yet.
+    /// Poll for the 32-bit result after svc; never overwrite an input pointer. A bounded failure
+    /// leaves the suspended thread's state untouched for its own wrapper to use.
+    private func settleReceive(on main: MainThread, stopped: arm_thread_state64_t,
+                               deadline: UInt64) -> arm_thread_state64_t? {
+        guard stopped.__pc >= 4,
+              let instructions = task.readWord(at: stopped.__pc - 4),
+              UInt32(truncatingIfNeeded: instructions) == Arc64.svcMachMsg2() else { return nil }
+        let instruction = UInt32(truncatingIfNeeded: instructions)
+        if let finished = ReceiveHandback.state(from: stopped, instructionBeforePC: instruction) {
+            return finished
+        }
+        guard thread_abort_safely(main.port) == KERN_SUCCESS else { return nil }
+        while DispatchTime.now().uptimeNanoseconds < deadline {
+            guard let state = main.state(), state.__pc == stopped.__pc else { return nil }
+            if let finished = ReceiveHandback.state(from: state, instructionBeforePC: instruction) {
+                return finished
+            }
+            usleep(10)
+        }
+        return nil
     }
 
     private func elapsedSince(_ started: UInt64) -> Int {

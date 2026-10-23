@@ -20,11 +20,24 @@ public struct MainThread {
     public static let asleepRunState: Int32 = 3
 }
 
+/// A suspended receive can still copy out a message and replace x0 (its buffer pointer) with a
+/// 32-bit kr. Only inspect this after the park check on a suspended arm64 CF run-loop thread.
+enum ReceiveHandback {
+    static func state(from state: arm_thread_state64_t, instructionBeforePC: UInt32) -> arm_thread_state64_t? {
+        // Require the return PC after svc #0x80. XNU's arm64 executable loader requires a
+        // 4 GiB pagezero, so a valid buffer pointer cannot be a zero-extended 32-bit Mach kr.
+        guard instructionBeforePC == 0xD400_1001, state.__x.0 <= UInt64(UInt32.max) else { return nil }
+        var result = state
+        // INTERRUPTED received no message. A timeout lets CF service our queued block; all
+        // other results, including SUCCESS/TOO_LARGE and errors, belong to the target.
+        if result.__x.0 == 0x1000_4005 { result.__x.0 = 0x1000_4003 }
+        return result
+    }
+}
+
 extension MainThread {
-    /// Stop and restart the thread. The executor stops it *before* reading its state: a thread that
-    /// wakes between a read and an entry is running app code, and the read is a frame the app has
-    /// left (measured: entering on it dies). While the thread is stopped, what we read is exactly
-    /// what it resumes with, so a check taken now cannot go stale.
+    /// Stop user execution before inspecting a frame. An in-flight kernel receive can continue;
+    /// its result must settle before the executor changes user state.
     @discardableResult
     public func suspend() -> kern_return_t { thread_suspend(port) }
 
@@ -69,16 +82,14 @@ extension MainThread {
 
 /// The app's own thread state, for the generated code to put back before it jumps away.
 extension ThreadHandback {
-    /// `restartAt` is the *start* of the call the thread was sitting in: a parked thread's pc is
-    /// the instruction after the trap, and returning there would hand CoreFoundation the result of
-    /// a call it never made.
-    public init(from state: arm_thread_state64_t, restartAt: UInt64) {
+    /// Capture the settled receive state and return through its original syscall wrapper.
+    public init(from state: arm_thread_state64_t) {
         var registers: [UInt64] = []
         withUnsafeBytes(of: state) { raw in
             // x0…x28, then x29 (fp) and x30 (lr): 31 words, flat, at the start of the struct.
             for index in 0..<31 { registers.append(raw.load(fromByteOffset: index * 8, as: UInt64.self)) }
         }
-        self.init(registers: registers, sp: state.__sp, pc: restartAt)
+        self.init(registers: registers, sp: state.__sp, pc: state.__pc)
     }
 }
 
@@ -141,27 +152,15 @@ extension TargetTask {
         return parkState(from: state)
     }
 
-    /// The decision for a thread state we have already read. The executor reads it with the thread
-    /// stopped, so the answer cannot change underneath the decision.
+    /// The park check identifies a safe run-loop frame, not a completed kernel receive. The
+    /// executor must still settle its return value before modifying the suspended thread.
     public func parkState(from state: arm_thread_state64_t) -> ParkState {
         guard let innerFrame = symbolName(at: state.__pc), Self.idleTraps.contains(innerFrame) else {
             return .running
         }
-        // The trap is a `mach_msg2` call in flight, its request in x1. The entry restarts that
-        // call from its start, and the raw `mach_msg2_trap` rejects a **timed** receive — one
-        // whose request carries `MACH_RCV_TIMEOUT` (0x100) — with `MACH_RCV_INVALID_ARGUMENTS`
-        // (0x10004013): reproduced in-process and in the stub's own absorber (identical kr,
-        // 2026-10-20). CoreFoundation's `__CFRunLoopServiceMachPort` tolerates only {success,
-        // TOO_LARGE (0x10004004), TIMED_OUT (0x10004003)} — `INVALID_ARGUMENTS` reaches its
-        // "unexpected kr" trap and the app dies (`__CFRunLoopServiceMachPort.cold.1`; the
-        // iTerm/Vivaldi class; five watch-captured hostapps, every death this kr). CF switches
-        // the service-port wait to its timed shape while timers are pending, i.e. exactly when
-        // wake traffic is being serviced; plain parks (0x507000806-form, no 0x100) restart
-        // cleanly — the form every clean entry ran on. Refuse the timed shape. (Earlier gates
-        // guarded 0x400 = `MACH_RCV_INTERRUPT`, then 0x10 = `MACH_SEND_TIMEOUT` — both the wrong
-        // bit; the header values are the ground truth.) Deferring the servicing moment is the
-        // same answer as any busy target; it lasts microseconds, and the scan loop retries
-        // every 250 ms.
+        // Keep entry restricted to the untimed run-loop wait. Timed receives are CF servicing
+        // traffic; deferring them preserves the existing park gate. The executor now returns
+        // through the syscall wrapper with the settled result instead of restarting a raw trap.
         guard state.__x.1 & Self.machRcvMsg != 0, state.__x.1 & Self.machRcvTimeout == 0 else {
             return .running
         }

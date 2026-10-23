@@ -5,4 +5,5 @@ tests/winpixels
 tests/pxband
 tests/wbounds
 tests/plainrunloop
+tests/timerloop
 .DS_Store

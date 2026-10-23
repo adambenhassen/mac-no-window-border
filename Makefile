@@ -41,6 +41,7 @@ test:
 	zsh tests/no-noborder.sh
 	cd app && swift test
 	$(MAKE) testtools probe
+	tests/timerwake.sh
 	tests/probe.sh
 	tests/engine.sh
 	tests/agent.sh
@@ -67,11 +68,15 @@ tests/wbounds: tests/wbounds.m
 tests/plainrunloop: tests/plainrunloop.swift
 	swiftc -O -o $@ $<
 
+# Windowless regression target for receive handback and default-mode timer wakes.
+tests/timerloop: tests/timerloop.swift
+	swiftc -O -o $@ $<
+
 # The pause benchmark: the app's own measure of how long each engine stops its main loop.
 bench: testtools probe
 	tests/pausebench.sh
 
 clean:
-	rm -rf build app/.build tests/hostapp tests/winpixels tests/pxband tests/wbounds tests/plainrunloop
+	rm -rf build app/.build tests/hostapp tests/winpixels tests/pxband tests/wbounds tests/plainrunloop tests/timerloop
 
 .PHONY: all app probe release install test testtools bench clean
